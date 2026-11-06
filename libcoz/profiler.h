@@ -178,8 +178,18 @@ public:
   void attach_thread();       //< Register the calling thread (DLL_THREAD_ATTACH)
   void detach_thread();       //< Unregister the calling thread (DLL_THREAD_DETACH)
   void exit_thread();         //< Pay the pending delays and quiesce the sampler before the thread exits
-  void apc_samples_ready();   //< Process the calling thread's samples (processing APC)
+  void apc_samples_ready();   //< Pay the calling thread's delays (sweep APC)
+
+  /// The delay a thread running guest code owes, which the sampler makes it pay suspended
+  size_t debt(thread_state* state) {
+    size_t global = _global_delay.load(), local = state->local_delay.load();
+    return _experiment_active.load() && !state->is_blocked.load() && global > local ? global - local : 0;
+  }
+  void paid(thread_state* state, size_t ns) {
+    state->local_delay.fetch_add(ns);
+  }
 #endif
+  bool count_samples(thread_state* state);    //< Match a thread's samples to lines and count its own delays. True on a hit
 
   /// Ensure a thread has executed all the required delays before possibly unblocking another thread
   void catch_up() {
@@ -196,7 +206,13 @@ public:
       // timer signals (every 10ms).  Process pending samples so the delay counters
       // are up-to-date before we potentially unblock another thread.
       // process_samples() calls add_delays() at the end.
+#ifdef _WIN32
+      // Its own samples are counted before it wakes a thread, which is credited for them
+      if(count_samples(state)) win_sampler_pay();
       process_samples(state);
+#else
+      process_samples(state);
+#endif
 #else
       // On macOS, samples are processed centrally by the profiler thread.
       add_delays(state);
@@ -211,8 +227,22 @@ public:
     if(!state)
       return;
 
+#ifdef _WIN32
+    // And before it blocks, while the threads it ran alongside still run, and its delays are paid. Counted later,
+    // the threads it wakes would be credited for them. Paid after the wake, often right after taking a lock,
+    // every other waiter of that lock waited for them too (FATO: lock convoys, a null line slowed GOW3 2.7x)
+    if(_experiment_active) {
+      state->set_in_use(true);
+      if(count_samples(state)) win_sampler_pay();
+      add_delays(state);
+      state->set_in_use(false);
+    }
+#endif
     state->is_blocked.store(true);
     state->pre_block_time = _global_delay.load();
+#ifdef _WIN32
+    state->pre_block_local = state->local_delay.load();
+#endif
   }
 
   /// Call after unblocking. If by_thread is true, delays will be skipped
@@ -225,7 +255,15 @@ public:
 
     if(skip_delays) {
       // Skip all delays that were inserted during the blocked period
-      state->local_delay.fetch_add(_global_delay.load() - state->pre_block_time);
+      size_t skipped = _global_delay.load() - state->pre_block_time;
+#ifdef _WIN32
+      // The sampler may have counted this thread's own samples while it was blocked, and their raise of the
+      // global delay is in the credit: added on top, they would count twice
+      size_t floor = state->pre_block_local + skipped, local = state->local_delay.load();
+      while(local < floor && !state->local_delay.compare_exchange_weak(local, floor)) {}
+#else
+      state->local_delay.fetch_add(skipped);
+#endif
     }
 
     // Must clear is_blocked before process_samples() because add_delays()

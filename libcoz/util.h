@@ -64,33 +64,23 @@ static size_t get_time() {
 }
 
 #ifdef _WIN32
-/// Sleep on the thread's high-resolution timer, then spin to the deadline. The timer
-/// alone overshoots by up to a millisecond, which would feed back into the delay counts.
+bool win_pause_until(size_t deadline);
+
+/// Sleep until the pauser thread wakes the thread right before the deadline. Spun by every paused
+/// thread, the end of a delay slowed the threads still running (FATO: a null line slowed GOW3 16%
+/// with whole delays spun); slept on a timer, it ran over and the excess fed back into the delay
+/// counts (FATO: 65% of the time in delays at 0% speedup)
 static inline size_t wait(size_t ns) {
   if(ns == 0) return 0;
 
   size_t start_time = get_time();
-  size_t deadline = start_time + ns;
-  HANDLE timer = win_wait_timer();
-  LARGE_INTEGER due;
 
   // coz's own threads need no precision. They only sleep, and shutdown ends the sleep, so an
   // experiment does not count the time after the program's last progress
-  if(timer == nullptr) {
+  if(!win_pause_until(start_time + ns)) {
+    LARGE_INTEGER due;
     due.QuadPart = -(LONGLONG)(ns / 100);
     real::NtWaitForSingleObject(g_stop, FALSE, &due);
-    return get_time() - start_time;
-  }
-
-  if(ns > g_spin_ns) {
-    due.QuadPart = -(LONGLONG)((ns - g_spin_ns) / 100);
-    SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
-    real::NtWaitForSingleObject(timer, FALSE, NULL);
-  }
-
-  for(size_t now = get_time(); now < deadline; now = get_time()) {
-    if(deadline - now > 20000) SwitchToThread();
-    else YieldProcessor();
   }
 
   return get_time() - start_time;

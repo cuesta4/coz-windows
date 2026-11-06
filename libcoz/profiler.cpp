@@ -589,7 +589,6 @@ thread_state* profiler::add_thread() {
     inserted->in_hook = true;
     inserted->is_blocked.store(false);
     inserted->local_delay.store(_global_delay.load());
-    inserted->wait_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     TlsSetValue(g_tls, inserted);
 #endif
     VERBOSE << "Registered thread tid=" << tid;
@@ -607,7 +606,6 @@ thread_state* profiler::get_thread_state() {
 
 void profiler::remove_thread() {
 #ifdef _WIN32
-  CloseHandle(get_thread_state()->wait_timer);
   TlsSetValue(g_tls, nullptr);
 #endif
   _thread_states.remove(gettid());
@@ -776,7 +774,7 @@ void profiler::add_delays(thread_state* state) {
   if(_experiment_active.load()) {
     // Don't execute delays on threads that are blocked (e.g., in pthread_join).
     // On macOS, wall-clock timers fire even on blocked threads, but these threads
-    // should not pause — post_block() will handle delay accounting on wake-up.
+    // should not pause â€” post_block() will handle delay accounting on wake-up.
     if(state->is_blocked.load()) return;
 
     // Take a snapshot of the global and local delays
@@ -791,7 +789,7 @@ void profiler::add_delays(thread_state* state) {
     if(local > global_delay) {
 #ifdef __APPLE__
       // On macOS, process_all_samples() pushes _global_delay when crediting
-      // the sampled thread. Don't push it again here — overshoot from nanosleep
+      // the sampled thread. Don't push it again here â€” overshoot from nanosleep
       // would amplify _global_delay beyond elapsed time, causing underflow in
       // the duration calculation.
       g_delays_skipped.fetch_add(1, std::memory_order_relaxed);
@@ -830,6 +828,18 @@ void profiler::add_delays(thread_state* state) {
 }
 
 void profiler::process_samples(thread_state* state) {
+#ifndef _WIN32
+  count_samples(state);
+#endif
+  add_delays(state);
+}
+
+bool profiler::count_samples(thread_state* state) {
+  bool hit = false;
+#ifdef _WIN32
+  // The sampler and the thread itself both count the ring: whoever comes second skips
+  if(state->sampler.counting.exchange(true)) return false;
+#endif
   for(perf_event::record r : state->sampler) {
     if(r.is_sample()) {
       // Find and match the line that contains this sample
@@ -840,8 +850,16 @@ void profiler::process_samples(thread_state* state) {
 
       if(_experiment_active) {
         // Add a delay if the sample is in the selected line
-        if(sampled_line.second)
-          state->local_delay.fetch_add(_delay_size.load());
+        if(sampled_line.second) {
+#ifdef _WIN32
+          // A Windows sample stands for the running time since the thread's previous sampler visit
+          size_t delay = _delay_size.load() * r.get_weight() / SamplePeriod;
+#else
+          size_t delay = _delay_size.load();
+#endif
+          state->local_delay.fetch_add(delay);
+          hit = true;
+        }
 
       } else if(sampled_line.first != nullptr && _next_line.load() == nullptr
                 && !is_coz_header(sampled_line.first)) {
@@ -850,7 +868,13 @@ void profiler::process_samples(thread_state* state) {
     }
   }
 
-  add_delays(state);
+#ifdef _WIN32
+  // The global delay is raised here, and the caller has the sampler make all the running threads pay it together
+  size_t local = state->local_delay.load(), global = _global_delay.load();
+  while(hit && local > global && !_global_delay.compare_exchange_weak(global, local)) {}
+  state->sampler.counting.store(false);
+#endif
+  return hit;
 }
 
 #ifndef _WIN32
@@ -911,7 +935,7 @@ void profiler::process_all_samples() {
             size_t new_global = _global_delay.fetch_add(delay_size) + delay_size;
 
             // Ensure the sampled thread's local_delay is at least new_global so it
-            // won't be incorrectly delayed in add_delays() — this thread is being
+            // won't be incorrectly delayed in add_delays() â€” this thread is being
             // "sped up" and should never pause.
             size_t local = sampled_state->local_delay.load();
             while(local < new_global) {
@@ -953,14 +977,14 @@ void profiler::process_all_samples() {
  */
 void profiler::apply_pending_delays() {
 #ifdef __APPLE__
-  // Don't signal threads during shutdown — they may have already exited
+  // Don't signal threads during shutdown â€” they may have already exited
   if(!_running.load()) return;
 
   // Signal all threads to wake up and check their delays.
   // Each thread will call add_delays() in its signal handler,
   // which will cause it to pause if it's behind on delays.
   _thread_states.for_each([](pid_t tid, thread_state* state) {
-    // Check _active first — stop() zeroes _target_pthread and then sets _active=false,
+    // Check _active first â€” stop() zeroes _target_pthread and then sets _active=false,
     // so if _active is false the thread is shutting down and we must not signal it.
     if(!state->sampler._active.load(std::memory_order_acquire)) return;
     pthread_t target = state->sampler._target_pthread;

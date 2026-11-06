@@ -23,7 +23,7 @@ public:
   perf_event sampler;       //< The sampler object for this thread
 #ifdef _WIN32
   bool in_hook = false;     //< Set while a sync hook runs, so nested hooked calls pass through
-  HANDLE wait_timer = nullptr;  //< High-resolution timer used by wait()
+  size_t pre_block_local;   //< The local delay saved before (possibly) blocking
 #else
   timer process_timer;      //< The timer that triggers sample processing for this thread
 #endif

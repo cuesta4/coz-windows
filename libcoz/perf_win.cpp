@@ -38,11 +38,14 @@ void perf_event::open(thread_state* owner) {
 
   // Thread state slots are reused, so every field is reset here
   QueryThreadCycleTime(h, &last_cycles);
-  acc = 0;
-  since_apc = 0;
+  last_visit = get_time();
   enabled.store(false);
   busy.store(false);
   apc_pending.store(false);
+  counting.store(false);
+  wake_at.store(0);
+  wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  REQUIRE(wake != nullptr) << "Failed to create the delay event";
   no_apc.store(false);
   active.store(true);
 
@@ -67,7 +70,8 @@ void perf_event::close() {
 
   slots[slot].store(nullptr);
   CloseHandle(h);
-  h = nullptr;
+  CloseHandle(wake);
+  h = wake = nullptr;
   VirtualFree(_ring, 0, MEM_RELEASE);
   _ring = nullptr;
 }
@@ -108,6 +112,18 @@ namespace {
 
   std::atomic<bool> g_run{false};
   HANDLE g_sampler = nullptr;
+  std::atomic<bool> g_pay{false};  //< Set with g_pay_event, which wakes the sampler for a payment visit
+  HANDLE g_pay_event = nullptr;
+
+  /// Guest code, outside every loaded module, cannot take the APC: a payment visit leaves such a thread
+  /// suspended, and the pauser thread resumes it when its debt is paid. One batch at a time, so that
+  /// all the threads of a visit pay together
+  struct hold { thread_state* state; size_t since, until; };
+  hold g_holds[64];
+  size_t g_nholds = 0;
+  std::atomic<bool> g_holding{false};  //< The pauser owns g_holds until it clears this
+  HANDLE g_pauser_event = nullptr;     //< Wakes the pauser for a new delay or batch
+  std::atomic<bool> g_rescan{false};   //< Set with g_pauser_event: a new deadline may come first
   uint64_t g_cycles_per_period = 0;  //< Thread cycles that make one SamplePeriod of CPU time
   BOOL (WINAPI* g_queue_apc2)(PAPCFUNC, HANDLE, ULONG_PTR, ULONG) = nullptr;
 
@@ -177,7 +193,7 @@ namespace {
   /// Unwind the stack of a suspended thread. The thread may hold any lock, so this only reads
   /// memory and calls RtlVirtualUnwind: no heap, no locks, no RtlLookupFunctionEntry, no DbgHelp.
   /// A memory read that faults just ends the walk
-  void walk_stack(CONTEXT* ctx, const NT_TIB* tib, const module_info* modules, size_t count,
+  __declspec(noinline) void walk_stack(CONTEXT* ctx, const NT_TIB* tib, const module_info* modules, size_t count,
                   sample_data* out, bool* in_syscall) {
     __try {
       // The thread is blocked in the kernel if it stopped right after a syscall instruction.
@@ -219,104 +235,176 @@ namespace {
     }
   }
 
-  /// Stop one thread and record where it is. Returns false if the thread could not be sampled
-  bool capture(perf_event& s, const module_table* table, sample_data& out, bool& in_syscall) {
+  /// Stop one thread and record where it is. On success the thread is left suspended
+  bool capture(perf_event& s, const module_table* table, sample_data& out, bool& in_syscall, bool& in_module) {
     if(SuspendThread(s.h) == (DWORD)-1) return false;
 
     CONTEXT ctx;
     ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-    bool ok = GetThreadContext(s.h, &ctx);  // Also waits for the suspension to complete
-    if(ok) {
-      out.ip = ctx.Rip;
-      out.tid = s.tid;
-      out.n = 0;
-      in_syscall = false;
-      walk_stack(&ctx, s.teb, table ? table->modules.data() : nullptr, table ? table->modules.size() : 0,
-                 &out, &in_syscall);
+    if(!GetThreadContext(s.h, &ctx)) {  // Also waits for the suspension to complete
+      ResumeThread(s.h);
+      return false;
     }
 
-    ResumeThread(s.h);
-    return ok;
+    const module_info* modules = table ? table->modules.data() : nullptr;
+    size_t count = table ? table->modules.size() : 0;
+    in_module = find_module(modules, count, ctx.Rip) != nullptr;
+    out.ip = ctx.Rip;
+    out.tid = s.tid;
+    out.n = 0;
+    in_syscall = false;
+    walk_stack(&ctx, s.teb, modules, count, &out, &in_syscall);
+    return true;
   }
 
-  /// Visit every registered thread once. A thread gets one sample per SamplePeriod of its own CPU time
-  void sample_all(const module_table* table) {
-    sample_data sample;
-    size_t high = perf_event::high_water.load();
-
-    for(size_t i = 0; i < high; i++) {
+  /// Run f on every registered thread. Pairs with close(): either it sees busy, or this sees that the thread is going away
+  template<class F> void for_each_thread(F f) {
+    for(size_t i = 0, high = perf_event::high_water.load(); i < high; i++) {
       thread_state* state = perf_event::slots[i].load();
-      if(state == nullptr) continue;
-      perf_event& s = state->sampler;
+      if(state == nullptr || !state->sampler.active.load()) continue;
+      state->sampler.busy.store(true);
+      if(state->sampler.active.load()) f(state, state->sampler);
+      state->sampler.busy.store(false);
+    }
+  }
 
-      // Pairs with close(): either it sees busy, or this sees that the thread is going away
-      if(!s.active.load()) continue;
-      s.busy.store(true);
-      if(!s.active.load()) {
-        s.busy.store(false);
-        continue;
+  /// Visit every registered thread once. A thread seen running is sampled. tick: the visit is the periodic one
+  void sample_all(const module_table* table, bool tick) {
+    sample_data sample;
+    static size_t visits = 0;
+    const bool sweep = tick && ++visits % SampleBatchSize == 0;
+
+    // Every SampleBatchSize visits the samples that the threads have not counted themselves are counted here, and
+    // after any raise of the global delay all the threads seen running pay together. Counted and paid by each
+    // thread apart, a thread that spins on another one's work waited through that one's pause and then paid its
+    // own (FATO: a null line slowed a spin-joined job by 23%)
+    bool pay = g_pay.exchange(false);
+    const bool can_hold = !g_holding.load();
+    if(sweep) for_each_thread([&](thread_state* state, perf_event&) { pay |= profiler::get_instance().count_samples(state); });
+
+    for_each_thread([&](thread_state* state, perf_event& s) {
+      // A thread seen running user code is sampled where it is, weighted by the time since its last
+      // visit; seen blocked, in a syscall or in a delay, it is not. Crediting CPU time and paying
+      // it at a later visit moved the samples of a thread that blocks and wakes toward wherever it
+      // was seen next (FATO: a job run right after waking got half of its samples). Only the periodic
+      // visits sample: a payment visit follows a raise by a thread, and finds it inside coz
+      bool ran = true;
+      size_t span = 0;
+      if(tick) {
+        ULONG64 cycles;
+        if(!QueryThreadCycleTime(s.h, &cycles)) return;
+        size_t now = get_time();
+        span = now - s.last_visit;
+        ran = cycles - s.last_cycles > g_cycles_per_period / 100;
+        s.last_cycles = cycles, s.last_visit = now;
       }
 
-      ULONG64 cycles;
-      if(QueryThreadCycleTime(s.h, &cycles)) {
-        uint64_t delta = cycles - s.last_cycles;
-        s.last_cycles = cycles;
+      // The thread pays its delays through an APC. Nothing is queued to a blocked thread,
+      // one in an alertable sleep that the APC would cut short, or while the last APC has not run.
+      // A special APC writes its frame right below RSP (FATO), which would destroy the red
+      // zone of SysV code such as a PS4 game's, so it is queued only while the thread is
+      // stopped inside a loaded module: it then runs right there, when the thread resumes
+      const bool apc = pay && !state->is_blocked.load() && !s.no_apc.load();
+      bool in_syscall = false, in_module = false;
+      if(!s.enabled.load() || !ran || !(tick || apc) || !capture(s, table, sample, in_syscall, in_module)) return;
 
-        // Time spent while stopped (during a delay) is not credited
-        if(s.enabled.load()) {
-          s.acc = std::min<uint64_t>(s.acc + delta, (uint64_t)SampleBatchSize * g_cycles_per_period);
-
-          if(s.acc >= g_cycles_per_period) {
-            bool in_syscall = false;
-            // A thread seen in a syscall keeps its credit and is paid at the next user mode visit
-            if(capture(s, table, sample, in_syscall) && !in_syscall) {
-              uint64_t n = std::min<uint64_t>(s.acc / g_cycles_per_period, SampleBatchSize);
-              s.acc -= n * g_cycles_per_period;
-
-              // Each copy stands for one SamplePeriod of CPU time, like a perf sample. A full ring drops
-              perf_event::ring* r = s._ring;
-              uint32_t write = r->write_idx.load(std::memory_order_relaxed);
-              uint32_t read = r->read_idx.load(std::memory_order_acquire);
-              size_t bytes = offsetof(sample_data, frames) + sample.n * sizeof(uint64_t);
-              for(uint64_t k = 0; k < n; k++) {
-                if(write - read >= perf_event::RingSize) {
-                  g_samples_dropped += n - k;
-                  break;
-                }
-                memcpy(&r->samples[write % perf_event::RingSize], &sample, bytes);
-                write++;
-                s.since_apc++;
-                g_samples_pushed++;
-              }
-              r->write_idx.store(write, std::memory_order_release);
-            }
-          }
+      if(tick && !in_syscall) {
+        // A full ring drops the sample
+        perf_event::ring* r = s._ring;
+        uint32_t write = r->write_idx.load(std::memory_order_relaxed);
+        uint32_t read = r->read_idx.load(std::memory_order_acquire);
+        if(write - read < perf_event::RingSize) {
+          sample.weight = std::min<size_t>(span, SampleBatchSize * SamplePeriod);
+          memcpy(&r->samples[write % perf_event::RingSize], &sample, offsetof(sample_data, frames) + sample.n * sizeof(uint64_t));
+          r->write_idx.store(write + 1, std::memory_order_release);
+          g_samples_pushed++;
+        } else {
+          g_samples_dropped++;
         }
       }
 
-      // The thread processes its own samples. Nothing is queued to a blocked thread, one in an
-      // alertable sleep that the APC would cut short, or while the last APC has not run
-      if(s.since_apc >= SampleBatchSize && !state->is_blocked.load() && !s.no_apc.load() &&
-         !s.apc_pending.exchange(true)) {
-        s.since_apc = 0;
+      if(apc && in_module && !s.apc_pending.exchange(true)) {
         if(g_queue_apc2(coz_apc, s.h, 0, SpecialUserApc)) g_apcs_queued++;
         else s.apc_pending.store(false);
       }
+      size_t debt = apc && !in_module && !in_syscall && can_hold && g_nholds < 64 ? profiler::get_instance().debt(state) : 0;
+      if(debt) {
+        size_t now = get_time();
+        g_holds[g_nholds++] = hold{state, now, now + debt};
+      } else {
+        ResumeThread(s.h);
+      }
+    });
 
-      s.busy.store(false);
+    if(can_hold && g_nholds) {
+      std::sort(g_holds, g_holds + g_nholds, [](const hold& a, const hold& b) { return a.until < b.until; });
+      g_holding.store(true);
+      g_rescan.store(true);
+      real::NtSetEvent(g_pauser_event, nullptr);
+    }
+  }
+
+  /// Ends every delay at its deadline: it wakes the threads sleeping in wait(), and resumes the held
+  /// threads, crediting each with the time it really stood still. It is the only thread that spins,
+  /// and only right before a deadline
+  DWORD WINAPI pauser_main(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    HANDLE wake[2] = {g_pauser_event, timer};
+    size_t resumed = 0;  //< Threads of the held batch already resumed
+    for(;;) {
+      size_t now = get_time(), next = SIZE_MAX;
+      for(size_t i = 0, high = perf_event::high_water.load(); i < high; i++) {
+        thread_state* state = perf_event::slots[i].load();
+        size_t at = state != nullptr ? state->sampler.wake_at.load() : 0;
+        if(at != 0 && at <= now) {
+          state->sampler.wake_at.store(0);
+          real::NtSetEvent(state->sampler.wake, nullptr);
+        } else if(at != 0) {
+          next = std::min(next, at);
+        }
+      }
+      if(g_holding.load()) {
+        for(; resumed < g_nholds && g_holds[resumed].until <= now; resumed++) {
+          ResumeThread(g_holds[resumed].state->sampler.h);
+          profiler::get_instance().paid(g_holds[resumed].state, get_time() - g_holds[resumed].since);
+        }
+        if(resumed < g_nholds) {
+          next = std::min(next, g_holds[resumed].until);
+        } else {
+          resumed = g_nholds = 0;
+          g_holding.store(false);
+        }
+      }
+
+      // Sleep while the next deadline is far, waking for a new one, then spin to it
+      if(next == SIZE_MAX) {
+        real::NtWaitForSingleObject(g_pauser_event, FALSE, NULL);
+      } else if(next > now + g_spin_ns) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)((next - now - g_spin_ns) / 100);
+        SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
+        real::NtWaitForMultipleObjects(2, wake, 1 /* WaitAny */, FALSE, NULL);
+      } else {
+        while(get_time() < next && !g_rescan.load()) YieldProcessor();
+        g_rescan.store(false);
+      }
     }
   }
 
   DWORD WINAPI sampler_main(LPVOID) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    HANDLE wake[2] = {timer, g_pay_event};
 
-    while(g_run.load()) {
+    // A payment visit leaves the timer running: re-armed from there, the samples fell at a fixed time
+    // after a raise, so always in the same phase of a frame (FATO: a serial line lost 30% of its hits)
+    for(bool tick = true; g_run.load();) {
       LARGE_INTEGER due;
       due.QuadPart = -(SamplePeriod / 100);
-      SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
-      real::NtWaitForSingleObject(timer, FALSE, NULL);
-      sample_all(g_modules.load());
+      if(tick) SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
+      tick = real::NtWaitForMultipleObjects(2, wake, 1 /* WaitAny */, FALSE, NULL) == 0;
+      sample_all(g_modules.load(), tick);
     }
 
     CloseHandle(timer);
@@ -391,9 +479,36 @@ void win_sampler_start() {
     update_modules(modules.data(), modules.size(), nullptr);
   }
 
+  g_pay_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  g_pauser_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   g_run.store(true);
+  // The pauser runs until the process ends: a thread may pay a delay at any time
+  HANDLE pauser = win_create_internal_thread(pauser_main, nullptr);
   g_sampler = win_create_internal_thread(sampler_main, nullptr);
-  REQUIRE(g_sampler != nullptr) << "Failed to start the sampler thread";
+  REQUIRE(g_sampler != nullptr && pauser != nullptr) << "Failed to start the sampler threads";
+  CloseHandle(pauser);
+}
+
+bool win_pause_until(size_t deadline) {
+  thread_state* state = static_cast<thread_state*>(TlsGetValue(g_tls));
+  if(state == nullptr || !state->sampler.active.load()) return false;
+
+  // Woken this early, the thread spins only the last stretch. Woken at the deadline, the latency of
+  // the wake ran over every delay, even a tiny one, and the excess fed back into the delay counts
+  // without end (FATO: 27% of the time in delays at 0% speedup)
+  const size_t lead = 150 * 1000;
+  if(deadline > get_time() + lead) {
+    state->sampler.wake_at.store(deadline - lead);
+    g_rescan.store(true);
+    real::NtSetEvent(g_pauser_event, nullptr);
+    real::NtWaitForSingleObject(state->sampler.wake, FALSE, NULL);
+  }
+  while(get_time() < deadline) YieldProcessor();
+  return true;
+}
+
+void win_sampler_pay() {
+  if(!g_pay.exchange(true)) real::NtSetEvent(g_pay_event, nullptr);
 }
 
 void win_sampler_stop() {

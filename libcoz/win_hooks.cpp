@@ -315,7 +315,7 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
 DWORD g_tls = TLS_OUT_OF_INDEXES;
 size_t g_spin_ns = 1000 * 1000;  // Replaced by the measured value when coz starts
 HANDLE g_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-std::atomic<DWORD> g_internal_tids[2];
+std::atomic<DWORD> g_internal_tids[3];
 
 HANDLE win_create_internal_thread(LPTHREAD_START_ROUTINE fn, LPVOID arg) {
   DWORD tid;
@@ -331,7 +331,3 @@ HANDLE win_create_internal_thread(LPTHREAD_START_ROUTINE fn, LPVOID arg) {
   return h;
 }
 
-HANDLE win_wait_timer() {
-  thread_state* state = static_cast<thread_state*>(TlsGetValue(g_tls));
-  return state != nullptr ? state->wait_timer : nullptr;
-}

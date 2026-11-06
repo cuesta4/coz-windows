@@ -70,9 +70,12 @@ endif()
 # Platform-specific libraries
 if(WIN32)
     target_link_libraries(coz PRIVATE detours dbghelp)
+    # Keep faulting sampler reads inside their SEH scope under optimization.
+    set_source_files_properties(perf_win.cpp PROPERTIES COMPILE_OPTIONS /EHa)
     # NOMINMAX: windows.h would otherwise break std::min/std::max
     target_compile_definitions(coz PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
     target_compile_options(coz PRIVATE /Z7)
+    target_link_options(coz PRIVATE /DEBUG)
 
     # Launches the profiled program with coz.dll injected
     add_executable(coz-launch ../tools/coz-launch.cpp)
