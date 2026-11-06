@@ -43,8 +43,10 @@ if(WIN32)
         ${DETOURS_SRC}/disolarm64.cpp)
     target_include_directories(detours PUBLIC ${DETOURS_SRC})
     target_compile_definitions(detours PRIVATE WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
-    # Upstream warnings are not ours to fix; /Zl matches Detours' own makefile
-    target_compile_options(detours PRIVATE /Zl /Gy /w)
+    # Upstream warnings are not ours to fix; /Zl matches Detours' own makefile. Detours does
+    # arithmetic on null module handles (creatwth.cpp, modules.cpp), which clang would otherwise
+    # optimize into a trap: DetourUpdateProcessWithDll compiles to int3
+    target_compile_options(detours PRIVATE /Zl /Gy /w /clang:-fno-delete-null-pointer-checks)
 else()
 # ============== LIEF library for cross-platform binary parsing ==============
 option(USE_SYSTEM_LIEF "Link against LIEF discovered via find_package" OFF)
