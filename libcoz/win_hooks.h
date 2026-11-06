@@ -29,6 +29,9 @@ namespace real {
                                                LPVOID, DWORD, LPPROC_THREAD_ATTRIBUTE_LIST, LPDWORD);
 }
 
+/// True while the calling thread owns the loader lock: coz never processes samples or pauses then
+bool win_holds_loader_lock();
+
 /// Shuts coz down when the process exits (libcoz.cpp)
 void coz_shutdown_process();
 

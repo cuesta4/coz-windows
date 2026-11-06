@@ -581,8 +581,15 @@ thread_state* profiler::add_thread() {
   if (inserted != nullptr) {
     _num_threads_running += 1;
 #ifdef _WIN32
-    TlsSetValue(g_tls, inserted);
+    // The slot is fresh or left over from an exited thread, and the hooks see it as soon as it
+    // is in TLS: reset it first. in_hook keeps hooked calls (the log below takes a CRT lock) from
+    // pausing the thread, often under the loader lock, until begin_sampling ends the registration
+    inserted->in_use = false;
+    inserted->in_hook = true;
+    inserted->is_blocked.store(false);
+    inserted->local_delay.store(_global_delay.load());
     inserted->wait_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    TlsSetValue(g_tls, inserted);
 #endif
     VERBOSE << "Registered thread tid=" << tid;
   }
@@ -638,6 +645,7 @@ void profiler::begin_sampling(thread_state* state) {
 #ifdef _WIN32
   state->sampler.open(state);
   state->sampler.start();
+  state->in_hook = false;  // Registration is complete: the hooks may account for this thread
 #elif !defined(__APPLE__)
   // Set the perf_event sampler configuration (Linux)
   struct perf_event_attr pe;
@@ -682,15 +690,7 @@ void profiler::end_sampling() {
 #ifdef _WIN32
 void profiler::attach_thread() {
   thread_state* state = add_thread();
-  if(state == nullptr) return;
-
-  // Thread state slots are reused
-  state->in_use = false;
-  state->is_blocked.store(false);
-  state->in_hook = true;  // under the loader lock: no delays from hooked calls in here
-  state->local_delay.store(_global_delay.load());
-  begin_sampling(state);
-  state->in_hook = false;
+  if(state != nullptr) begin_sampling(state);
 }
 
 void profiler::detach_thread() {
@@ -719,7 +719,8 @@ void profiler::apc_samples_ready() {
   if(state == nullptr) return;
 
   state->sampler.apc_pending.store(false);
-  if(!state->check_in_use()) {
+  // Under the loader lock the samples wait in the ring for the next APC
+  if(!state->check_in_use() && !win_holds_loader_lock()) {
     // The hooked locks of the allocator must not re-enter process_samples
     bool was_hooked = state->in_hook;
     state->in_hook = true;

@@ -108,6 +108,12 @@ template<> struct result<void> {
 /// The PEB LoaderLock, read when the hooks are installed. Delaying a thread that holds it would stall the process
 static void* g_loader_lock = nullptr;
 
+bool win_holds_loader_lock() {
+  // DllMain and TLS callbacks of every DLL run with it held, including thread attach and detach
+  const RTL_CRITICAL_SECTION* cs = static_cast<const RTL_CRITICAL_SECTION*>(g_loader_lock);
+  return cs != nullptr && cs->OwningThread == (HANDLE)(ULONG_PTR)GetCurrentThreadId();
+}
+
 template<class T, class... R> static void* first(T t, R...) { return (void*)(ULONG_PTR)t; }
 
 /// Common skeleton of the synchronization hooks. in_hook covers the original call too, so the
@@ -116,7 +122,8 @@ template<int F, int M, class Fn, class... A>
 static auto hooked(Fn& fn, A... a) -> decltype(fn(a...)) {
   typedef decltype(fn(a...)) R;
   thread_state* state = tls_state();
-  if(state == nullptr || state->in_hook || ((F & Loader) && first(a...) == g_loader_lock))
+  if(state == nullptr || state->in_hook || ((F & Loader) && first(a...) == g_loader_lock) ||
+     win_holds_loader_lock())
     return fn(a...);
 
   profiler& p = profiler::get_instance();
