@@ -9,6 +9,8 @@
 #include <dbghelp.h>
 #include <psapi.h>
 
+#include <detours.h>
+
 #include <algorithm>
 #include <cctype>
 #include <set>
@@ -137,18 +139,20 @@ namespace {
     return TRUE;
   }
 
-  /// Find the innermost inlined frame of an address that is in scope
-  bool in_scope_inline_frame(HANDLE proc, line_context& c, uint64_t address, uint32_t& file, size_t& line) {
-    DWORD frames = SymAddrIncludeInlineTrace(proc, address);
+  /// Find the innermost frame of an inlined address that is in scope. The chain ends with the
+  /// function that contains the address, at the line of its own line table
+  bool in_scope_inline_frame(HANDLE proc, line_context& c, uint64_t address, DWORD frames,
+                             uint32_t& file, size_t& line) {
     DWORD context, index;
-    if(frames == 0 || !SymQueryInlineTrace(proc, address, 0, address, address, &context, &index))
+    if(!SymQueryInlineTrace(proc, address, 0, address, address, &context, &index))
       return false;
 
     for(DWORD k = 0; k <= frames; k++) {
       IMAGEHLP_LINEW64 info;
       info.SizeOfStruct = sizeof(info);
       DWORD displacement;
-      if(!SymGetLineFromInlineContextW(proc, address, context + k, 0, &displacement, &info))
+      if(!SymGetLineFromInlineContextW(proc, address, context + k, 0, &displacement, &info) ||
+         info.LineNumber == 0xFEEFEE || info.LineNumber == 0xF00F00)
         continue;
 
       uint32_t id = file_id(c, info.FileName);
@@ -224,16 +228,40 @@ bool memory_map::process_file(const string& name, uintptr_t load_address,
     if(i + 1 < records.size())
       limit = min(limit, records[i + 1].address);
 
-    // Code from an out-of-scope file, such as a user lambda inlined into a library
-    // function, is attributed to the in-scope frame of its inline chain
-    uint32_t file = records[i].file;
-    size_t line = records[i].line;
-    if(!context.files[file].in_scope && !in_scope_inline_frame(proc, context, address, file, line))
-      continue;
+    // The PDB line table gives inlined code the line of its outermost call site, while the DWARF
+    // line table on Linux gives the inlinee's own lines. So inlined instructions take the innermost
+    // in-scope frame of their inline chain, which also covers out-of-scope code such as a user
+    // lambda inlined into a library function. Runs of instructions with the same line become ranges
+    const uint32_t none = UINT32_MAX;
+    uint64_t run = address;
+    uint32_t run_file = none;
+    size_t run_line = 0;
+    for(uint64_t x = address; x <= limit;) {
+      uint32_t file = records[i].file;
+      size_t line = records[i].line;
+      if(x < limit) {
+        DWORD frames = SymAddrIncludeInlineTrace(proc, x);
+        bool ok = frames > 0 ? in_scope_inline_frame(proc, context, x, frames, file, line)
+                             : context.files[file].in_scope;
+        if(!ok) file = none;
+      }
 
-    const string& name = context.files[file].name;
-    included_files.insert(name);
-    add_range(name, line, interval((uintptr_t)address, (uintptr_t)limit));
+      if(x == limit || file != run_file || line != run_line) {
+        if(run_file != none && x > run) {
+          const string& name = context.files[run_file].name;
+          included_files.insert(name);
+          add_range(name, run_line, interval((uintptr_t)run, (uintptr_t)x));
+        }
+        run = x;
+        run_file = file;
+        run_line = line;
+      }
+      if(x == limit) break;
+
+      // Step one instruction. Bytes that do not decode end the splitting of this record
+      uint64_t next = (uint64_t)DetourCopyInstruction(nullptr, nullptr, (PVOID)x, nullptr, nullptr);
+      x = (next > x && next <= limit) ? next : limit;
+    }
   }
 
   for(const string& filename : included_files) {
