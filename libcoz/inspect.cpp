@@ -5,7 +5,7 @@
  * directory of this distribution and at http://github.com/plasma-umass/coz.
  */
 
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(_WIN32)
 #include <link.h>
 #include <limits.h>
 #include <unistd.h>
@@ -13,14 +13,18 @@
 
 #include "inspect.h"
 
+#ifndef _WIN32
 #include "lief_loader.h"
+#endif
 
 #ifdef __APPLE__
   #include <mach-o/dyld.h>
 #endif
 #include <stdlib.h>
+#ifndef _WIN32
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <cstdint>
 #include <iostream>
@@ -34,7 +38,9 @@
 #include <vector>
 
 #include <algorithm>
+#ifndef _WIN32
 #include <dwarf++.hh>
+#endif
 
 #include "util.h"
 
@@ -43,6 +49,7 @@
 
 using namespace std;
 
+#ifndef _WIN32
 static dwarf::value find_attribute(const dwarf::die& d, dwarf::DW_AT attr);
 
 static string absolute_path(const string filename) {
@@ -108,6 +115,7 @@ static const string get_full_path(const string filename) {
 
   return "";
 }
+#endif
 
 #ifdef __APPLE__
 unordered_map<string, uintptr_t> get_loaded_files() {
@@ -124,7 +132,7 @@ unordered_map<string, uintptr_t> get_loaded_files() {
 
   return result;
 }
-#else
+#elif !defined(_WIN32)
 /// Resolve the main executable's path, since dl_iterate_phdr reports it as "".
 static string main_executable_path() {
   char buffer[PATH_MAX];
@@ -223,10 +231,26 @@ bool wildcard_match(const string& subject, const string& pattern) {
   return wildcard_match(subject.begin(), subject.end(), pattern.begin(), pattern.end());
 }
 
+#ifdef _WIN32
+/// Windows paths compare case-insensitively and may use either slash
+static string fold(string s) {
+  for(char& c : s)
+    c = (c == '\\') ? '/' : (char)tolower((unsigned char)c);
+  return s;
+}
+#endif
+
 static bool in_scope_normalized(const string& normalized,
                                 const unordered_set<string>& scope) {
+#ifdef _WIN32
+  const string subject = fold(normalized);
+#endif
   for(const string& pattern : scope) {
+#ifdef _WIN32
+    if(wildcard_match(subject, fold(pattern))) {
+#else
     if(wildcard_match(normalized, pattern)) {
+#endif
       return true;
     }
   }
@@ -239,9 +263,15 @@ bool in_scope(const string& name, const unordered_set<string>& scope) {
 }
 
 
-static bool file_matches_scope(const string& name,
-                               const unordered_set<string>& scope,
-                               bool allow_system_sources) {
+#ifdef _WIN32
+// Shared with inspect_pdb.cpp
+bool
+#else
+static bool
+#endif
+file_matches_scope(const string& name,
+                   const unordered_set<string>& scope,
+                   bool allow_system_sources) {
   if(name.empty())
     return false;
   string normalized = canonicalize_path(name);
@@ -258,6 +288,7 @@ static bool file_matches_scope(const string& name,
   return in_scope_normalized(normalized, scope);
 }
 
+#ifndef _WIN32
 static void enqueue_range(vector<memory_map::queued_range>& pending,
                           const string& filename,
                           size_t line_no,
@@ -369,6 +400,7 @@ static const subprogram_range* find_subprogram(const vector<subprogram_range>& r
     return &(*it);
   return nullptr;
 }
+#endif
 
 void memory_map::build(const unordered_set<string>& binary_scope,
                        const unordered_set<string>& source_scope,
@@ -395,6 +427,7 @@ void memory_map::build(const unordered_set<string>& binary_scope,
     << "Debug information was not found for any in-scope executables or libraries";
 }
 
+#ifndef _WIN32
 dwarf::value find_attribute(const dwarf::die& d, dwarf::DW_AT attr) {
   if(!d.valid())
     return dwarf::value();
@@ -422,6 +455,7 @@ dwarf::value find_attribute(const dwarf::die& d, dwarf::DW_AT attr) {
 
   return dwarf::value();
 }
+#endif
 
 void memory_map::add_range(std::string filename, size_t line_no, interval range) {
   shared_ptr<file> f = get_file(filename);
@@ -430,6 +464,7 @@ void memory_map::add_range(std::string filename, size_t line_no, interval range)
   _ranges.emplace(range, l);
 }
 
+#ifndef _WIN32
 void memory_map::process_inlines(const dwarf::die& d,
                                  const dwarf::line_table& table,
                                  const unordered_set<string>& source_scope,
@@ -666,9 +701,10 @@ bool memory_map::process_file(const string& name, uintptr_t load_address,
 
   return true;
 }
+#endif
 
 shared_ptr<line> memory_map::find_line(const string& name) {
-  string::size_type colon_pos = name.find_first_of(':');
+  string::size_type colon_pos = name.rfind(':');
   if(colon_pos == string::npos) {
     WARNING << "Could not identify file name in input " << name;
     return shared_ptr<line>();
@@ -676,13 +712,21 @@ shared_ptr<line> memory_map::find_line(const string& name) {
 
   string filename = name.substr(0, colon_pos);
   string line_no_str = name.substr(colon_pos + 1);
+#ifdef _WIN32
+  filename = fold(filename);
+#endif
 
   size_t line_no;
   stringstream(line_no_str) >> line_no;
 
   for(const auto& f : files()) {
-    string::size_type last_pos = f.first.rfind(filename);
-    if(last_pos != string::npos && last_pos + filename.size() == f.first.size()) {
+#ifdef _WIN32
+    const string path = fold(f.first);
+#else
+    const string& path = f.first;
+#endif
+    string::size_type last_pos = path.rfind(filename);
+    if(last_pos != string::npos && last_pos + filename.size() == path.size()) {
       if(f.second->has_line(line_no)) {
         return f.second->get_line(line_no);
       }

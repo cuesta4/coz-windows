@@ -5,6 +5,7 @@
  * directory of this distribution and at http://github.com/plasma-umass/coz.
  */
 
+#ifndef _WIN32
 #include <dlfcn.h>
 #ifdef __APPLE__
   #include <limits.h>
@@ -13,19 +14,26 @@
   #include <linux/limits.h>
 #endif
 #include <pthread.h>
+#endif
 #include <stdlib.h>
+#ifndef _WIN32
 #include <sys/stat.h>
+#endif
 
 #include <sstream>
 #include <string>
 #include <unordered_set>
 
 #include "inspect.h"
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 
 #include "profiler.h"
 #include "progress_point.h"
+#ifndef _WIN32
 #include "real.h"
+#endif
 #include "util.h"
 
 #include "ccutil/log.h"
@@ -133,6 +141,7 @@ extern "C" coz_counter_t* _coz_get_counter(progress_point_type t, const char* na
   }
 }
 
+#ifndef _WIN32
 /**
  * Read a link's contents and return it as a string
  */
@@ -171,6 +180,7 @@ static string readlink_str(const char* path) {
   }
 #endif
 }
+#endif
 
 /*
  * Initialize coz.  This will either happen as main() is called using
@@ -187,8 +197,10 @@ void init_coz(void) {
   VERBOSE << "bootstrapping coz";
   initialized = false;
 
+#ifndef _WIN32
   // Remove Coz from LD_PRELOAD. Just clearing LD_PRELOAD for now FIXME!
   unsetenv("LD_PRELOAD");
+#endif
 
   // Read settings out of environment variables
   string output_file = getenv_safe("COZ_OUTPUT", "profile.coz");
@@ -210,6 +222,7 @@ void init_coz(void) {
   int fixed_speedup;
   stringstream(getenv_safe("COZ_FIXED_SPEEDUP", "-1")) >> fixed_speedup;
 
+#ifndef _WIN32
   // Replace 'MAIN' in the binary_scope with the real path of the main executable
   if(binary_scope.find("MAIN") != binary_scope.end()) {
     binary_scope.erase("MAIN");
@@ -234,6 +247,7 @@ void init_coz(void) {
     binary_scope.insert(main_name);
     VERBOSE << "Including MAIN, which is " << main_name;
   }
+#endif
 
   // Build the memory map for all in-scope binaries
   bool filter_system_sources = getenv("COZ_FILTER_SYSTEM");
@@ -277,6 +291,7 @@ void init_coz(void) {
   VERBOSE << "init_coz complete, returning...";
 }
 
+#ifndef _WIN32
 /**
  * Pass the real __libc_start_main this main function, then run the real main
  * function. This allows Coz to shut down when the real main function returns.
@@ -397,7 +412,9 @@ static stack_t* coz_alt_stack() {
   return &storage;
 }
 #endif
+#endif // !_WIN32
 
+#ifndef _WIN32
 extern "C" {
 // On macOS, all wrappers are in mac_interpose.cpp using DYLD interposition
 #ifndef __APPLE__
@@ -785,3 +802,4 @@ extern "C" {
   }
 #endif // !__APPLE__
 }
+#endif // !_WIN32

@@ -11,13 +11,15 @@
 // Platform-specific includes
 #ifdef __APPLE__
   #include "perf_macos.h"
+#elif defined(_WIN32)
+  #include "perf_win.h"
 #else
   // Linux version
   #include <linux/perf_event.h>
   #include <sys/types.h>
 #endif
 
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(_WIN32)
 // Linux-specific implementation continues below
 
 #include <cstddef>
@@ -246,6 +248,6 @@ private:
   uint64_t _read_format = 0;
 };
 
-#endif // !__APPLE__
+#endif // !__APPLE__ && !_WIN32
 
 #endif // CAUSAL_RUNTIME_PERF_H

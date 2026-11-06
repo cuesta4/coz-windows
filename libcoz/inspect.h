@@ -192,6 +192,21 @@ private:
   std::map<interval, std::shared_ptr<line>> _ranges;
 };
 
+#ifdef _WIN32
+#include <unordered_map>
+
+/// Map each loaded module's path to its base address (inspect_pdb.cpp)
+std::unordered_map<std::string, uintptr_t> get_loaded_files();
+
+/// Absolute path with forward slashes and an upper-case drive letter (inspect_pdb.cpp)
+std::string canonicalize_path(const std::string& filename);
+
+/// Check a canonicalized source file against the scope patterns (inspect.cpp)
+bool file_matches_scope(const std::string& name,
+                        const std::unordered_set<std::string>& scope,
+                        bool allow_system_sources);
+#endif
+
 static std::ostream& operator<<(std::ostream& os, const interval& i) {
   os << std::hex << "0x" << i.get_base() << "-0x" << i.get_limit() << std::dec;
   return os;

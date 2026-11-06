@@ -8,6 +8,9 @@
 #ifndef COZ_PATH_FILTER_H
 #define COZ_PATH_FILTER_H
 
+#ifdef _WIN32
+#include <cctype>
+#endif
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -23,6 +26,26 @@ inline bool path_has_prefix(const std::string& path, const std::string& prefix) 
 }
 
 inline bool is_system_path(const std::string& normalized) {
+#ifdef _WIN32
+  // Toolchain and SDK headers can live under any drive or install directory
+  static const char* const parts[] = {
+    "/vc/tools/msvc/",
+    "/windows kits/",
+    "/microsoft visual studio/",
+    "/lib/clang/",
+    "/vctools/crt/",
+    "/minkernel/",
+    "/onecore/"
+  };
+  std::string lower(normalized);
+  for(char& c : lower)
+    c = (char)std::tolower((unsigned char)c);
+  for(const char* part : parts) {
+    if(lower.find(part) != std::string::npos)
+      return true;
+  }
+  return false;
+#else
   static const std::vector<std::string> prefixes = {
     "/usr/include",
     "/usr/lib",
@@ -36,6 +59,7 @@ inline bool is_system_path(const std::string& normalized) {
       return true;
   }
   return false;
+#endif
 }
 
 inline bool is_rust_path(const std::string& normalized) {

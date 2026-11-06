@@ -70,7 +70,12 @@ public:
 private:
   size_t get_bucket(K key) {
     // TODO: Support hash function parameter if this class is reused
+#ifdef _WIN32
+    // Windows thread IDs are multiples of 4
+    return (key >> 2) % MapSize;
+#else
     return key % MapSize;
+#endif
   }
   
   struct entry {

@@ -10,19 +10,28 @@
 
 #if defined(__APPLE__)
 #include <mach/mach_time.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#include <stdlib.h>
 #else
 #include <time.h>
 #endif
 
+#ifndef _WIN32
 #include <signal.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
 
 #include <sstream>
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include "win_hooks.h"
+#else
 #include "real.h"
+#endif
 
 /**
  * Get the current time in nanoseconds
@@ -37,6 +46,13 @@ static size_t get_time() {
     mach_timebase_info(&timebase);
   }
   return (mach_absolute_time() * timebase.numer) / timebase.denom;
+#elif defined(_WIN32)
+  // Split the conversion so that ticks * 1e9 cannot overflow
+  LARGE_INTEGER ticks, freq;
+  QueryPerformanceCounter(&ticks);
+  QueryPerformanceFrequency(&freq);
+  return ticks.QuadPart / freq.QuadPart * 1000000000ull +
+         ticks.QuadPart % freq.QuadPart * 1000000000ull / freq.QuadPart;
 #else
   struct timespec ts;
   if(clock_gettime(CLOCK_REALTIME, &ts)) {
@@ -47,6 +63,31 @@ static size_t get_time() {
 #endif
 }
 
+#ifdef _WIN32
+/// Sleep on the thread's high-resolution timer, then spin to the deadline. The timer
+/// alone overshoots by up to a millisecond, which would feed back into the delay counts.
+static inline size_t wait(size_t ns) {
+  if(ns == 0) return 0;
+
+  size_t start_time = get_time();
+  size_t deadline = start_time + ns;
+
+  if(ns > g_spin_ns) {
+    LARGE_INTEGER due;
+    due.QuadPart = -(LONGLONG)((ns - g_spin_ns) / 100);
+    HANDLE timer = win_wait_timer();
+    SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
+    real::NtWaitForSingleObject(timer, FALSE, NULL);
+  }
+
+  for(size_t now = get_time(); now < deadline; now = get_time()) {
+    if(deadline - now > 20000) SwitchToThread();
+    else YieldProcessor();
+  }
+
+  return get_time() - start_time;
+}
+#else
 static inline size_t wait(size_t ns) {
   if(ns == 0) return 0;
 
@@ -59,6 +100,7 @@ static inline size_t wait(size_t ns) {
 
   return get_time() - start_time;
 }
+#endif
 
 static inline std::vector<std::string> split(const std::string& s, char delim='\t') {
   std::vector<std::string> elems;

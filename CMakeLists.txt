@@ -1,4 +1,8 @@
 cmake_minimum_required(VERSION 3.13.0)
+if(POLICY CMP0091)
+    # Makes MSVC_RUNTIME_LIBRARY effective (MSVC-like toolchains only)
+    cmake_policy(SET CMP0091 NEW)
+endif()
 project(coz VERSION 0.2.5 LANGUAGES C CXX)
 
 enable_testing()
@@ -11,6 +15,37 @@ list(APPEND CMAKE_MODULE_PATH ${PROJECT_BINARY_DIR} ${PROJECT_SOURCE_DIR}/cmake)
 
 find_package(Threads REQUIRED)
 
+if(WIN32)
+    # coz.dll and coz-launch.exe link the CRT statically, so that they share no ucrt state
+    # with the profiled program
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+    # Detours injects coz.dll and hooks the Windows synchronization functions
+    include(FetchContent)
+    FetchContent_Declare(
+        detours
+        GIT_REPOSITORY https://github.com/microsoft/Detours.git
+        GIT_TAG        1dbd4ea281d73d478aa8d09a8b83fbd265f715f7
+    )
+    FetchContent_MakeAvailable(detours)
+
+    set(DETOURS_SRC ${detours_SOURCE_DIR}/src)
+    add_library(detours STATIC
+        ${DETOURS_SRC}/detours.cpp
+        ${DETOURS_SRC}/modules.cpp
+        ${DETOURS_SRC}/disasm.cpp
+        ${DETOURS_SRC}/image.cpp
+        ${DETOURS_SRC}/creatwth.cpp
+        ${DETOURS_SRC}/disolx86.cpp
+        ${DETOURS_SRC}/disolx64.cpp
+        ${DETOURS_SRC}/disolia64.cpp
+        ${DETOURS_SRC}/disolarm.cpp
+        ${DETOURS_SRC}/disolarm64.cpp)
+    target_include_directories(detours PUBLIC ${DETOURS_SRC})
+    target_compile_definitions(detours PRIVATE WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+    # Upstream warnings are not ours to fix; /Zl matches Detours' own makefile
+    target_compile_options(detours PRIVATE /Zl /Gy /w)
+else()
 # ============== LIEF library for cross-platform binary parsing ==============
 option(USE_SYSTEM_LIEF "Link against LIEF discovered via find_package" OFF)
 
@@ -122,6 +157,7 @@ endif()
 # Always emit debug info so line tables are available when resolving
 # progress points, but let the toolchain decide which DWARF version to use.
 add_compile_options(-g)
+endif()
 
 option(INSTALL_COZ "Enable installation of coz. (Projects embedding coz may want to turn this OFF.)" ON)
 
@@ -186,7 +222,9 @@ if(BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
 endif()
 
-add_subdirectory(tests)
+if(NOT WIN32)
+    add_subdirectory(tests)
+endif()
 
 if(APPLE)
     # 1. Specify the location of private frameworks to the linker

@@ -1,3 +1,23 @@
+if(WIN32)
+set(sources
+    ${PROJECT_SOURCE_DIR}/include/coz.h
+    coz.def
+    inspect.cpp
+    inspect.h
+    inspect_pdb.cpp
+    libcoz.cpp
+    perf.h
+    perf_win.cpp
+    perf_win.h
+    profiler.cpp
+    profiler.h
+    progress_point.h
+    thread_state.h
+    util.h
+    win_hooks.cpp
+    win_hooks.h
+    )
+else()
 set(sources
     ${PROJECT_SOURCE_DIR}/include/coz.h
     inspect.cpp
@@ -15,6 +35,7 @@ set(sources
     thread_state.h
     util.h
     )
+endif()
 
 # Add macOS-specific files on Apple platforms
 if(APPLE)
@@ -42,10 +63,21 @@ target_include_directories(coz
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
 # Go's linker and GNU ld emit zlib-compressed DWARF; lief_loader inflates it.
-find_package(ZLIB REQUIRED)
+if(NOT WIN32)
+    find_package(ZLIB REQUIRED)
+endif()
 
 # Platform-specific libraries
-if(APPLE)
+if(WIN32)
+    target_link_libraries(coz PRIVATE detours dbghelp)
+    # NOMINMAX: windows.h would otherwise break std::min/std::max
+    target_compile_definitions(coz PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+    target_compile_options(coz PRIVATE /Z7)
+
+    # Launches the profiled program with coz.dll injected
+    add_executable(coz-launch ../tools/coz-launch.cpp)
+    target_link_libraries(coz-launch PRIVATE detours)
+elseif(APPLE)
     target_link_libraries(coz PRIVATE ZLIB::ZLIB ${CMAKE_DL_LIBS} Threads::Threads libelfin::libelfin LIEF::LIEF)
 else()
     target_link_libraries(coz PRIVATE ZLIB::ZLIB ${CMAKE_DL_LIBS} rt Threads::Threads libelfin::libelfin LIEF::LIEF)
@@ -60,7 +92,7 @@ target_include_directories(coz-instrumentation
 # Platform-specific linker flags
 if(APPLE)
     target_link_libraries(coz-instrumentation INTERFACE ${CMAKE_DL_LIBS})
-else()
+elseif(NOT WIN32)
     target_link_libraries(coz-instrumentation INTERFACE -Wl,--push-state,--no-as-needed ${CMAKE_DL_LIBS} -Wl,--pop-state)
 endif()
 

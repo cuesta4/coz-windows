@@ -37,8 +37,17 @@ extern "C" int coz_orig_pthread_create(pthread_t*, const pthread_attr_t*,
 /// The type of a main function
 typedef int (*main_fn_t)(int, char**, char**);
 
+/// The type of a thread ID
+#ifdef _WIN32
+typedef DWORD coz_tid_t;
+#else
+typedef pid_t coz_tid_t;
+#endif
+
 enum {
+#ifndef _WIN32
   SampleSignal = SIGPROF, //< Signal to generate when samples are ready
+#endif
   SamplePeriod = 1000000, //< Time between samples (1ms)
   SampleBatchSize = 10,   //< Samples to batch together for one processing run
   SpeedupDivisions = 20,  //< How many different speedups to try (20 = 5% increments)
@@ -114,6 +123,7 @@ public:
     return result;
   }
 
+#ifndef _WIN32
   /// Pass local delay counts and excess delay time to the child thread
   int handle_pthread_create(pthread_t* thread,
                             const pthread_attr_t* attr,
@@ -158,6 +168,7 @@ public:
     real::pthread_exit(result);
     abort(); // Silence g++ warning about noreturn
   }
+#endif
 
   /// Ensure a thread has executed all the required delays before possibly unblocking another thread
   void catch_up() {
@@ -260,10 +271,14 @@ private:
   thread_state* get_thread_state(); //< Get a reference to the thread state object for this thread
   void remove_thread(); //< Remove the thread state structure for the current thread
 
+#ifdef _WIN32
+  static DWORD WINAPI start_profiler_thread(LPVOID);  //< Entry point for the profiler thread
+#else
   static void* start_profiler_thread(void*);          //< Entry point for the profiler thread
   static void* start_thread(void* arg);               //< Entry point for wrapped threads
   static void samples_ready(int, siginfo_t*, void*);  //< Signal handler for sample processing
   static void on_error(int, siginfo_t*, void*);       //< Handle errors
+#endif
 
   /// A map from name to throughput monitoring progress points
   std::unordered_map<std::string, throughput_point*> _throughput_points;
@@ -273,7 +288,7 @@ private:
   std::unordered_map<std::string, latency_point*> _latency_points;
   spinlock _latency_points_lock;  //< Spinlock that protects the latency points map
 
-  static_map<pid_t, thread_state> _thread_states;   //< Map from thread IDs to thread-local state
+  static_map<coz_tid_t, thread_state> _thread_states;   //< Map from thread IDs to thread-local state
   std::atomic<size_t> _num_threads_running;         //< Number of threads that are currently being sampled
 
   std::atomic<bool> _experiment_active; //< Is an experiment running?
@@ -282,7 +297,11 @@ private:
   std::atomic<line*> _selected_line;    //< The line to speed up
   std::atomic<line*> _next_line;        //< The next line to speed up
 
+#ifdef _WIN32
+  HANDLE _profiler_thread;        //< Handle for the profiler thread
+#else
   pthread_t _profiler_thread;     //< Handle for the profiler thread
+#endif
   std::atomic<bool> _running;     //< Clear to signal the profiler thread to quit
   std::string _output_filename;   //< File for profiler output
   line* _fixed_line;              //< The only line that should be sped up, if set

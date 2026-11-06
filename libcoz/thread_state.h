@@ -10,14 +10,23 @@
 
 #include <atomic>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include "ccutil/timer.h"
+#endif
 
 class thread_state {
 public:
   bool in_use = false;      //< Set by the main thread to prevent signal handler from racing
   std::atomic<size_t> local_delay{0};   //< The count of delays (or selected line visits) in the thread
   perf_event sampler;       //< The sampler object for this thread
+#ifdef _WIN32
+  bool in_hook = false;     //< Set while a sync hook runs, so nested hooked calls pass through
+  HANDLE wait_timer = nullptr;  //< High-resolution timer used by wait()
+#else
   timer process_timer;      //< The timer that triggers sample processing for this thread
+#endif
   size_t pre_block_time;    //< The time saved before (possibly) blocking
   std::atomic<bool> is_blocked{false};  //< True between pre_block() and post_block(); skip delays
   

@@ -8,17 +8,24 @@
 #if !defined(COZ_H)
 #define COZ_H
 
-#ifndef __USE_GNU
-#  define __USE_GNU
+#ifndef _WIN32
+#  ifndef __USE_GNU
+#    define __USE_GNU
+#  endif
+
+#  ifndef _GNU_SOURCE
+#    define _GNU_SOURCE
+#  endif
+
+#  include <dlfcn.h>
 #endif
 
-#ifndef _GNU_SOURCE
-#  define _GNU_SOURCE
-#endif
-
-#include <dlfcn.h>
 #include <stdint.h>
 #include <string.h> /* for memcpy hack below */
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#  include <intrin.h>
+#endif
 
 #if defined(__cplusplus)
 extern "C" {
@@ -28,8 +35,27 @@ extern "C" {
 #define COZ_COUNTER_TYPE_BEGIN 2
 #define COZ_COUNTER_TYPE_END 3
 
+#ifdef _WIN32
+// Declared compatibly with windows.h, which is deliberately not included here
+__declspec(dllimport) struct HINSTANCE__* __stdcall GetModuleHandleA(const char*);
+__declspec(dllimport) long long (__stdcall* __stdcall GetProcAddress(struct HINSTANCE__*, const char*))(void);
+
+// Locate a function exported by coz.dll
+static void* _coz_dlsym(const char* name) {
+  struct HINSTANCE__* m = GetModuleHandleA("coz.dll");
+  long long (__stdcall* f)(void) = m ? GetProcAddress(m, name) : 0;
+  void* p;
+  memcpy(&p, &f, sizeof(p));
+  return p;
+}
+#  define _COZ_DLSYM(name) _coz_dlsym(name)
+#  define _COZ_HAVE_DLSYM 1
+#else
 // Declare dlsym as a weak reference so libdl isn't required
 void* dlsym(void* handle, const char* symbol) __attribute__((weak));
+#  define _COZ_DLSYM(name) dlsym(RTLD_DEFAULT, name)
+#  define _COZ_HAVE_DLSYM dlsym
+#endif
 
 // Counter info struct, containing both a counter and backoff size
 typedef struct {
@@ -55,9 +81,9 @@ static coz_counter_t* _call_coz_get_counter(int type, const char* name) {
   static coz_get_counter_t fn; // The pointer to _coz_get_counter
 
   if(!_initialized) {
-    if(dlsym) {
+    if(_COZ_HAVE_DLSYM) {
       // Locate the _coz_get_counter method
-      void* p = dlsym(RTLD_DEFAULT, "_coz_get_counter");
+      void* p = _COZ_DLSYM("_coz_get_counter");
 
       // Use memcpy to avoid pedantic GCC complaint about storing function pointer in void*
       memcpy(&fn, &p, sizeof(p));
@@ -79,9 +105,9 @@ static void _call_coz_add_delays(void) {
   static coz_add_delays_t fn; // The pointer to _coz_add_delays
 
   if(!_initialized) {
-    if(dlsym) {
+    if(_COZ_HAVE_DLSYM) {
       // Locate the _coz_add_delays method
-      void* p = dlsym(RTLD_DEFAULT, "_coz_add_delays");
+      void* p = _COZ_DLSYM("_coz_add_delays");
 
       // Use memcpy to avoid pedantic GCC complaint about storing function pointer in void*
       memcpy(&fn, &p, sizeof(p));
@@ -100,8 +126,8 @@ static void _call_coz_pre_block(void) {
   static coz_pre_block_t fn;
 
   if(!_initialized) {
-    if(dlsym) {
-      void* p = dlsym(RTLD_DEFAULT, "_coz_pre_block");
+    if(_COZ_HAVE_DLSYM) {
+      void* p = _COZ_DLSYM("_coz_pre_block");
       memcpy(&fn, &p, sizeof(p));
     }
     _initialized = 1;
@@ -116,8 +142,8 @@ static void _call_coz_post_block(int skip_delays) {
   static coz_post_block_t fn;
 
   if(!_initialized) {
-    if(dlsym) {
-      void* p = dlsym(RTLD_DEFAULT, "_coz_post_block");
+    if(_COZ_HAVE_DLSYM) {
+      void* p = _COZ_DLSYM("_coz_post_block");
       memcpy(&fn, &p, sizeof(p));
     }
     _initialized = 1;
@@ -137,6 +163,12 @@ static void _call_coz_post_block(int skip_delays) {
 #  define _COZ_CHECK_DELAYS ((void)0)
 #endif
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#  define _COZ_ATOMIC_INC(p) _InterlockedIncrement64((volatile __int64*)(p))
+#else
+#  define _COZ_ATOMIC_INC(p) __atomic_add_fetch((p), 1, __ATOMIC_RELAXED)
+#endif
+
 // Macro to initialize and increment a counter, then check for pending delays.
 #define COZ_INCREMENT_COUNTER(type, name) \
   if(1) { \
@@ -148,7 +180,7 @@ static void _call_coz_post_block(int skip_delays) {
       _initialized = 1; \
     } \
     if(_counter) { \
-      __atomic_add_fetch(&_counter->count, 1, __ATOMIC_RELAXED); \
+      _COZ_ATOMIC_INC(&_counter->count); \
       _COZ_CHECK_DELAYS; \
     } \
   }

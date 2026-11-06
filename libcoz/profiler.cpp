@@ -7,6 +7,10 @@
 
 #include "profiler.h"
 
+#ifdef _WIN32
+  #include <string.h>
+  static inline coz_tid_t gettid() { return GetCurrentThreadId(); }
+#else
 #ifndef __APPLE__
   #include <asm/unistd.h>
 #else
@@ -31,6 +35,7 @@
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -48,7 +53,9 @@
 
 #include "ccutil/log.h"
 #include "ccutil/spinlock.h"
+#ifndef _WIN32
 #include "ccutil/timer.h"
+#endif
 
 using namespace std;
 
@@ -108,6 +115,7 @@ void profiler::startup(const string& outfile,
                        line* fixed_line,
                        int fixed_speedup,
                        bool end_to_end) {
+#ifndef _WIN32
   // Set up the sampling signal handler.
   // On macOS, use the __asm-bound original sigaction to bypass our own
   // DYLD interposition which blocks setting handlers for coz's signals.
@@ -144,6 +152,7 @@ void profiler::startup(const string& outfile,
   real::sigaction(SIGABRT, &sa, nullptr);
   real::sigaction(SIGBUS, &sa, nullptr);
 #endif
+#endif
 
   // Save the output file name
   _output_filename = outfile;
@@ -175,6 +184,9 @@ void profiler::startup(const string& outfile,
   // On macOS, use the original pthread_create from mac_interpose.cpp to avoid
   // recursion through the interposed function
   int rc = coz_orig_pthread_create(&_profiler_thread, nullptr, profiler::start_profiler_thread, (void*)&l);
+#elif defined(_WIN32)
+  _profiler_thread = win_create_internal_thread(profiler::start_profiler_thread, (LPVOID)&l);
+  int rc = _profiler_thread ? 0 : (int)GetLastError();
 #else
   int rc = real::pthread_create(&_profiler_thread, nullptr, profiler::start_profiler_thread, (void*)&l);
 #endif
@@ -541,6 +553,9 @@ void profiler::shutdown() {
 #ifdef __APPLE__
     // Use __asm-bound original to bypass DYLD interposition
     coz_orig_pthread_join(_profiler_thread, nullptr);
+#elif defined(_WIN32)
+    real::NtWaitForSingleObject(_profiler_thread, FALSE, NULL);
+    CloseHandle(_profiler_thread);
 #else
     real::pthread_join(_profiler_thread, nullptr);
 #endif
@@ -551,24 +566,37 @@ void profiler::shutdown() {
 }
 
 thread_state* profiler::add_thread() {
-  pid_t tid = gettid();
+  coz_tid_t tid = gettid();
   thread_state* inserted = _thread_states.insert(tid);
   if (inserted != nullptr) {
     _num_threads_running += 1;
+#ifdef _WIN32
+    TlsSetValue(g_tls, inserted);
+    inserted->wait_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+#endif
     VERBOSE << "Registered thread tid=" << tid;
   }
   return inserted;
 }
 
 thread_state* profiler::get_thread_state() {
+#ifdef _WIN32
+  return static_cast<thread_state*>(TlsGetValue(g_tls));
+#else
   return _thread_states.find(gettid());
+#endif
 }
 
 void profiler::remove_thread() {
+#ifdef _WIN32
+  CloseHandle(get_thread_state()->wait_timer);
+  TlsSetValue(g_tls, nullptr);
+#endif
   _thread_states.remove(gettid());
   _num_threads_running -= 1;
 }
 
+#ifndef _WIN32
 /**
  * Entry point for wrapped threads
  */
@@ -594,9 +622,13 @@ void* profiler::start_thread(void* p) {
   // Always exit via pthread_exit
   pthread_exit(result);
 }
+#endif
 
 void profiler::begin_sampling(thread_state* state) {
-#ifndef __APPLE__
+#ifdef _WIN32
+  state->sampler.open(state);
+  state->sampler.start();
+#elif !defined(__APPLE__)
   // Set the perf_event sampler configuration (Linux)
   struct perf_event_attr pe;
   memset(&pe, 0, sizeof(pe));
@@ -757,6 +789,7 @@ void profiler::process_samples(thread_state* state) {
   add_delays(state);
 }
 
+#ifndef _WIN32
 /**
  * Process samples from all thread states.
  * This is called from the profiler thread on macOS where signal-based
@@ -847,6 +880,7 @@ void profiler::process_all_samples() {
   // This matches the Linux implementation and ensures delay time is properly
   // tracked in global_delay for the duration correction.
 }
+#endif
 
 /**
  * Apply pending delays to all threads by signaling them to self-regulate.
@@ -876,6 +910,13 @@ void profiler::apply_pending_delays() {
 /**
  * Entry point for the profiler thread
  */
+#ifdef _WIN32
+DWORD WINAPI profiler::start_profiler_thread(LPVOID arg) {
+  spinlock* l = (spinlock*)arg;
+  profiler::get_instance().profiler_thread(*l);
+  return 0;
+}
+#else
 void* profiler::start_profiler_thread(void* arg) {
   spinlock* l = (spinlock*)arg;
   profiler::get_instance().profiler_thread(*l);
@@ -929,3 +970,4 @@ void profiler::on_error(int signum, siginfo_t* info, void* p) {
 
   _exit(2);
 }
+#endif
