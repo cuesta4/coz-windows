@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -165,6 +166,118 @@ namespace {
 
     return false;
   }
+
+  /// A range of a source line, relative to the module base
+  struct cached_range {
+    uint32_t file, line, low, high;
+  };
+
+  /// The cache holds the file names, then the ranges, each set after its count
+  bool read_cache(const wstring& path, vector<string>& names, vector<cached_range>& ranges) {
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    if(f == nullptr) return false;
+    uint32_t files = 0;
+    uint64_t count = 0;
+    bool ok = fread(&files, sizeof(files), 1, f) == 1;
+    for(uint32_t i = 0; ok && i < files; i++) {
+      uint32_t size = 0;
+      ok = fread(&size, sizeof(size), 1, f) == 1 && size < 65536;
+      names.emplace_back(ok ? size : 0, '\0');
+      ok = ok && fread(&names.back()[0], 1, size, f) == size;
+    }
+    ok = ok && fread(&count, sizeof(count), 1, f) == 1 && count < (1ull << 32);
+    if(ok) ranges.resize(count);
+    ok = ok && fread(ranges.data(), sizeof(cached_range), count, f) == count;
+    fclose(f);
+    for(const cached_range& r : ranges) ok = ok && r.file < names.size();
+    return ok;
+  }
+
+  void write_cache(const wstring& path, const vector<string>& names, const vector<cached_range>& ranges) {
+    wstring partial = path + L".part";
+    FILE* f = _wfopen(partial.c_str(), L"wb");
+    if(f == nullptr) return;
+    uint32_t files = (uint32_t)names.size();
+    uint64_t count = ranges.size();
+    bool ok = fwrite(&files, sizeof(files), 1, f) == 1;
+    for(const string& name : names) {
+      uint32_t size = (uint32_t)name.size();
+      ok = ok && fwrite(&size, sizeof(size), 1, f) == 1 && fwrite(name.data(), 1, size, f) == size;
+    }
+    ok = ok && fwrite(&count, sizeof(count), 1, f) == 1 && fwrite(ranges.data(), sizeof(cached_range), count, f) == count;
+    ok = fclose(f) == 0 && ok;
+    if(!ok || !MoveFileExW(partial.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) DeleteFileW(partial.c_str());
+  }
+}
+
+/// The line ranges of a module whose symbols are loaded at its real base
+static void build_ranges(HANDLE proc, DWORD64 base, const unordered_set<string>& source_scope,
+                         bool allow_system_sources, vector<string>& names, vector<cached_range>& ranges) {
+  line_context context{source_scope, allow_system_sources, {}, {}, {}};
+  SymEnumLinesW(proc, base, NULL, NULL, on_line, &context);
+
+  // Line records come in no particular order, and several can share an address (prologue
+  // lines). Keep the last one of each address, as the DWARF line table does
+  stable_sort(context.records.begin(), context.records.end(),
+              [](const line_record& a, const line_record& b) { return a.address < b.address; });
+  vector<line_record> records;
+  for(const line_record& r : context.records) {
+    if(!records.empty() && records.back().address == r.address)
+      records.back() = r;
+    else
+      records.push_back(r);
+  }
+
+  // A range ends at the next line record or the end of its function, whichever is first.
+  // Leaf functions have no unwind data, so function bounds come from the symbols
+  vector<function_range> functions;
+  SymEnumSymbolsW(proc, base, L"*", on_symbol, &functions);
+  sort(functions.begin(), functions.end());
+
+  for(size_t i = 0; i < records.size(); i++) {
+    uint64_t address = records[i].address;
+    auto f = upper_bound(functions.begin(), functions.end(), function_range{address, UINT64_MAX});
+    if(f == functions.begin() || address >= (--f)->high)
+      continue;
+
+    uint64_t limit = f->high;
+    if(i + 1 < records.size())
+      limit = min(limit, records[i + 1].address);
+
+    // The PDB line table gives inlined code the line of its outermost call site, while the DWARF
+    // line table on Linux gives the inlinee's own lines. So inlined instructions take the innermost
+    // in-scope frame of their inline chain, which also covers out-of-scope code such as a user
+    // lambda inlined into a library function. Runs of instructions with the same line become ranges
+    const uint32_t none = UINT32_MAX;
+    uint64_t run = address;
+    uint32_t run_file = none;
+    size_t run_line = 0;
+    for(uint64_t x = address; x <= limit;) {
+      uint32_t file = records[i].file;
+      size_t line = records[i].line;
+      if(x < limit) {
+        DWORD frames = SymAddrIncludeInlineTrace(proc, x);
+        bool ok = frames > 0 ? in_scope_inline_frame(proc, context, x, frames, file, line)
+                             : context.files[file].in_scope;
+        if(!ok) file = none;
+      }
+
+      if(x == limit || file != run_file || line != run_line) {
+        if(run_file != none && x > run)
+          ranges.push_back(cached_range{run_file, (uint32_t)run_line, (uint32_t)(run - base), (uint32_t)(x - base)});
+        run = x;
+        run_file = file;
+        run_line = line;
+      }
+      if(x == limit) break;
+
+      // Step one instruction. Bytes that do not decode end the splitting of this record
+      uint64_t next = (uint64_t)DetourCopyInstruction(nullptr, nullptr, (PVOID)x, nullptr, nullptr);
+      x = (next > x && next <= limit) ? next : limit;
+    }
+  }
+
+  for(const source_file& f : context.files) names.push_back(f.name);
 }
 
 bool memory_map::process_file(const string& name, uintptr_t load_address,
@@ -195,75 +308,38 @@ bool memory_map::process_file(const string& name, uintptr_t load_address,
     return false;
   }
 
-  // Addresses are absolute because the module was loaded at its real base
-  line_context context{source_scope, allow_system_sources, {}, {}, {}};
-  SymEnumLinesW(proc, base, NULL, NULL, on_line, &context);
+  // The pass over the instructions below takes minutes on a large program (FATO: 131 s on GOW3, nearly all in
+  // DbgHelp's inline lookups), and its ranges depend only on the PDB and the scope: they are kept in the temp
+  // directory, under a hash of both
+  uint64_t key = 14695981039346656037ull;
+  auto mix = [&key](const void* p, size_t n) {
+    for(size_t i = 0; i < n; i++) key = (key ^ static_cast<const uint8_t*>(p)[i]) * 1099511628211ull;
+  };
+  mix("coz-lines-1", 11);
+  mix(&module.PdbSig70, sizeof(module.PdbSig70));
+  mix(&module.PdbAge, sizeof(module.PdbAge));
+  mix(&allow_system_sources, sizeof(allow_system_sources));
+  for(const string& s : set<string>(source_scope.begin(), source_scope.end())) mix(s.c_str(), s.size() + 1);
+  wchar_t temp[MAX_PATH + 1], file[32];
+  swprintf(file, 32, L"coz-%016llx.lines", (unsigned long long)key);
+  wstring cache = wstring(temp, GetTempPathW(MAX_PATH + 1, temp)) + file;
 
-  // Line records come in no particular order, and several can share an address (prologue
-  // lines). Keep the last one of each address, as the DWARF line table does
-  stable_sort(context.records.begin(), context.records.end(),
-              [](const line_record& a, const line_record& b) { return a.address < b.address; });
-  vector<line_record> records;
-  for(const line_record& r : context.records) {
-    if(!records.empty() && records.back().address == r.address)
-      records.back() = r;
-    else
-      records.push_back(r);
+  vector<string> names;
+  vector<cached_range> ranges;
+  if(read_cache(cache, names, ranges)) {
+    VERBOSE << "Line ranges of " << name << " read from the cache";
+  } else {
+    names.clear();
+    ranges.clear();
+    build_ranges(proc, base, source_scope, allow_system_sources, names, ranges);
+    write_cache(cache, names, ranges);
   }
-
-  // A range ends at the next line record or the end of its function, whichever is first.
-  // Leaf functions have no unwind data, so function bounds come from the symbols
-  vector<function_range> functions;
-  SymEnumSymbolsW(proc, base, L"*", on_symbol, &functions);
-  sort(functions.begin(), functions.end());
 
   set<string> included_files;
-  for(size_t i = 0; i < records.size(); i++) {
-    uint64_t address = records[i].address;
-    auto f = upper_bound(functions.begin(), functions.end(), function_range{address, UINT64_MAX});
-    if(f == functions.begin() || address >= (--f)->high)
-      continue;
-
-    uint64_t limit = f->high;
-    if(i + 1 < records.size())
-      limit = min(limit, records[i + 1].address);
-
-    // The PDB line table gives inlined code the line of its outermost call site, while the DWARF
-    // line table on Linux gives the inlinee's own lines. So inlined instructions take the innermost
-    // in-scope frame of their inline chain, which also covers out-of-scope code such as a user
-    // lambda inlined into a library function. Runs of instructions with the same line become ranges
-    const uint32_t none = UINT32_MAX;
-    uint64_t run = address;
-    uint32_t run_file = none;
-    size_t run_line = 0;
-    for(uint64_t x = address; x <= limit;) {
-      uint32_t file = records[i].file;
-      size_t line = records[i].line;
-      if(x < limit) {
-        DWORD frames = SymAddrIncludeInlineTrace(proc, x);
-        bool ok = frames > 0 ? in_scope_inline_frame(proc, context, x, frames, file, line)
-                             : context.files[file].in_scope;
-        if(!ok) file = none;
-      }
-
-      if(x == limit || file != run_file || line != run_line) {
-        if(run_file != none && x > run) {
-          const string& name = context.files[run_file].name;
-          included_files.insert(name);
-          add_range(name, run_line, interval((uintptr_t)run, (uintptr_t)x));
-        }
-        run = x;
-        run_file = file;
-        run_line = line;
-      }
-      if(x == limit) break;
-
-      // Step one instruction. Bytes that do not decode end the splitting of this record
-      uint64_t next = (uint64_t)DetourCopyInstruction(nullptr, nullptr, (PVOID)x, nullptr, nullptr);
-      x = (next > x && next <= limit) ? next : limit;
-    }
+  for(const cached_range& r : ranges) {
+    included_files.insert(names[r.file]);
+    add_range(names[r.file], r.line, interval((uintptr_t)(base + r.low), (uintptr_t)(base + r.high)));
   }
-
   for(const string& filename : included_files) {
     VERBOSE << "Included source file " << filename;
   }
