@@ -71,11 +71,19 @@ static inline size_t wait(size_t ns) {
 
   size_t start_time = get_time();
   size_t deadline = start_time + ns;
+  HANDLE timer = win_wait_timer();
+  LARGE_INTEGER due;
+
+  // coz's own threads need no precision. They only sleep, and shutdown ends the sleep, so an
+  // experiment does not count the time after the program's last progress
+  if(timer == nullptr) {
+    due.QuadPart = -(LONGLONG)(ns / 100);
+    real::NtWaitForSingleObject(g_stop, FALSE, &due);
+    return get_time() - start_time;
+  }
 
   if(ns > g_spin_ns) {
-    LARGE_INTEGER due;
     due.QuadPart = -(LONGLONG)((ns - g_spin_ns) / 100);
-    HANDLE timer = win_wait_timer();
     SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
     real::NtWaitForSingleObject(timer, FALSE, NULL);
   }

@@ -564,6 +564,7 @@ void profiler::shutdown() {
     // Use __asm-bound original to bypass DYLD interposition
     coz_orig_pthread_join(_profiler_thread, nullptr);
 #elif defined(_WIN32)
+    SetEvent(g_stop);
     real::NtWaitForSingleObject(_profiler_thread, FALSE, NULL);
     CloseHandle(_profiler_thread);
 #else

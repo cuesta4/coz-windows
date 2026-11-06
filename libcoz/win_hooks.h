@@ -37,6 +37,7 @@ void coz_shutdown_process();
 
 extern DWORD g_tls;       //< TLS slot that holds the calling thread's thread_state*
 extern size_t g_spin_ns;  //< Time wait() spins at the end of a delay instead of sleeping
+extern HANDLE g_stop;     //< Set at shutdown, it ends the waits of coz's own threads
 
 /// IDs of coz's own threads. They are never registered, sampled or suspended
 extern std::atomic<DWORD> g_internal_tids[2];
@@ -44,7 +45,7 @@ extern std::atomic<DWORD> g_internal_tids[2];
 /// Create and start a coz internal thread
 HANDLE win_create_internal_thread(LPTHREAD_START_ROUTINE fn, LPVOID arg);
 
-/// High-resolution timer of the calling thread, used by wait()
+/// High-resolution timer of the calling thread, used by wait(). Null on coz's own threads
 HANDLE win_wait_timer();
 
 #endif
