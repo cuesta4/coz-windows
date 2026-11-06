@@ -174,6 +174,11 @@ void profiler::startup(const string& outfile,
   // Should end-to-end mode be enabled?
   _enable_end_to_end = end_to_end;
 
+#ifdef _WIN32
+  // Calibrates, then starts crediting samples to the threads that are registered
+  win_sampler_start();
+#endif
+
   // Use a spinlock to wait for the profiler thread to finish intialization
   spinlock l;
   l.lock();
@@ -546,6 +551,11 @@ void profiler::shutdown() {
     macos_sampling_stop();
 #endif
 
+#ifdef _WIN32
+    // No more samples or APCs once the sampler is gone
+    win_sampler_stop();
+#endif
+
     // "Signal" the profiler thread to stop
     _running.store(false);
 
@@ -668,6 +678,53 @@ void profiler::end_sampling() {
     remove_thread();
   }
 }
+
+#ifdef _WIN32
+void profiler::attach_thread() {
+  thread_state* state = add_thread();
+  if(state == nullptr) return;
+
+  // Thread state slots are reused
+  state->in_use = false;
+  state->is_blocked.store(false);
+  state->in_hook = false;
+  state->local_delay.store(_global_delay.load());
+  begin_sampling(state);
+}
+
+void profiler::detach_thread() {
+  thread_state* state = get_thread_state();
+  if(state != nullptr) {
+    state->sampler.close();
+    remove_thread();
+  }
+}
+
+void profiler::exit_thread() {
+  thread_state* state = get_thread_state();
+  if(state == nullptr) return;
+
+  // in_use and in_hook stay set: an APC or a hooked lock release (catch_up would clear in_use)
+  // while the thread is torn down, under the loader lock, must not process samples or pause it
+  state->set_in_use(true);
+  state->in_hook = true;
+  process_samples(state);
+  state->sampler.no_apc.store(true);
+  state->sampler.stop();
+}
+
+void profiler::apc_samples_ready() {
+  thread_state* state = get_thread_state();
+  if(state == nullptr) return;
+
+  state->sampler.apc_pending.store(false);
+  if(!state->check_in_use()) {
+    state->set_in_use(true);
+    process_samples(state);
+    state->set_in_use(false);
+  }
+}
+#endif
 
 std::pair<line*,bool> profiler::match_line(perf_event::record& sample) {
   // bool -> true: hit selected_line

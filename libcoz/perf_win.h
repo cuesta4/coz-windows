@@ -116,4 +116,10 @@ public:
   static std::atomic<size_t> high_water;  //< One past the highest slot ever used
 };
 
+/// Calibrate the sampler and start its thread. Threads that register later are picked up
+void win_sampler_start();
+
+/// Stop the sampler thread and wait for it. No sample or APC is produced afterwards
+void win_sampler_stop();
+
 #endif

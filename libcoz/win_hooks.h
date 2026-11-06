@@ -23,6 +23,10 @@ namespace real {
 
 namespace real {
   extern VOID (NTAPI* RtlExitUserProcess)(NTSTATUS);
+  extern VOID (NTAPI* RtlExitUserThread)(NTSTATUS);
+  extern NTSTATUS (NTAPI* NtDelayExecution)(BOOLEAN, PLARGE_INTEGER);
+  extern HANDLE (WINAPI* CreateRemoteThreadEx)(HANDLE, LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE,
+                                               LPVOID, DWORD, LPPROC_THREAD_ATTRIBUTE_LIST, LPDWORD);
 }
 
 /// Shuts coz down when the process exits (libcoz.cpp)

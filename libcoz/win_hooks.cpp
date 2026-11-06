@@ -21,7 +21,11 @@ extern bool initialized;
 
 /// Every hook is a row: module, function. Each row needs a real:: pointer in win_hooks.h
 /// and a hook_<function> below
-#define HOOKS(X)   X(L"ntdll.dll", RtlExitUserProcess)
+#define HOOKS(X) \
+  X(L"ntdll.dll", RtlExitUserProcess) \
+  X(L"ntdll.dll", RtlExitUserThread) \
+  X(L"ntdll.dll", NtDelayExecution) \
+  X(L"kernelbase.dll", CreateRemoteThreadEx)
 
 namespace real {
   NTSTATUS (NTAPI* NtWaitForSingleObject)(HANDLE, BOOLEAN, PLARGE_INTEGER) =
@@ -30,12 +34,86 @@ namespace real {
   VOID (NTAPI* RtlExitUserProcess)(NTSTATUS) =
     reinterpret_cast<decltype(RtlExitUserProcess)>(
       GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlExitUserProcess"));
+  VOID (NTAPI* RtlExitUserThread)(NTSTATUS) =
+    reinterpret_cast<decltype(RtlExitUserThread)>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlExitUserThread"));
+  NTSTATUS (NTAPI* NtDelayExecution)(BOOLEAN, PLARGE_INTEGER) =
+    reinterpret_cast<decltype(NtDelayExecution)>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtDelayExecution"));
+  HANDLE (WINAPI* CreateRemoteThreadEx)(HANDLE, LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE,
+                                        LPVOID, DWORD, LPPROC_THREAD_ATTRIBUTE_LIST, LPDWORD) =
+    reinterpret_cast<decltype(CreateRemoteThreadEx)>(
+      GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "CreateRemoteThreadEx"));
+}
+
+/// The state of the calling thread if it is registered and coz is running. Unlike a bare
+/// TlsGetValue it keeps the last error
+static thread_state* tls_state() {
+  DWORD error = GetLastError();
+  thread_state* state = initialized ? static_cast<thread_state*>(TlsGetValue(g_tls)) : nullptr;
+  SetLastError(error);
+  return state;
 }
 
 /// The CRT of a /MT target is already torn down when this runs, so only coz's own CRT is used
 static VOID NTAPI hook_RtlExitUserProcess(NTSTATUS status) {
   if(initialized) coz_shutdown_process();
   real::RtlExitUserProcess(status);
+}
+
+/// Pay the pending delays before the thread exits, as it may be what a join is waiting for
+static VOID NTAPI hook_RtlExitUserThread(NTSTATUS status) {
+  thread_state* state = tls_state();
+  if(state != nullptr && !state->in_hook) {
+    profiler::get_instance().exit_thread();
+  }
+  real::RtlExitUserThread(status);
+}
+
+/// Only protects the processing APC, which would cut an alertable sleep short.
+/// It has no blocking semantics, like nanosleep on Linux
+static NTSTATUS NTAPI hook_NtDelayExecution(BOOLEAN alertable, PLARGE_INTEGER interval) {
+  thread_state* state = tls_state();
+  if(state == nullptr || state->in_hook || !alertable)
+    return real::NtDelayExecution(alertable, interval);
+
+  state->sampler.no_apc.store(true);
+  NTSTATUS result = real::NtDelayExecution(alertable, interval);
+  state->sampler.no_apc.store(false);
+  return result;
+}
+
+/// Entry point of the threads created in this process: starts them with their parent delay count
+static DWORD WINAPI coz_thread_trampoline(LPVOID p) {
+  thread_start_arg* arg = static_cast<thread_start_arg*>(p);
+  thread_fn_t fn = arg->_fn;
+  void* fn_arg = arg->_arg;
+
+  // The thread registered itself in DLL_THREAD_ATTACH, before getting here
+  thread_state* state = tls_state();
+  if(state != nullptr) state->local_delay.store(arg->_parent_delay_time);
+  delete arg;
+
+  return fn(fn_arg);
+}
+
+static HANDLE WINAPI hook_CreateRemoteThreadEx(HANDLE process, LPSECURITY_ATTRIBUTES attributes,
+                                               SIZE_T stack_size, LPTHREAD_START_ROUTINE fn, LPVOID arg,
+                                               DWORD flags, LPPROC_THREAD_ATTRIBUTE_LIST list, LPDWORD id) {
+  thread_state* state = tls_state();
+  if(state == nullptr || state->in_hook ||
+     (process != GetCurrentProcess() && GetProcessId(process) != GetCurrentProcessId()))
+    return real::CreateRemoteThreadEx(process, attributes, stack_size, fn, arg, flags, list, id);
+
+  state->in_hook = true;
+  thread_start_arg* wrapped = new thread_start_arg(fn, arg, state->local_delay.load());
+  HANDLE thread = real::CreateRemoteThreadEx(process, attributes, stack_size, coz_thread_trampoline,
+                                             wrapped, flags, list, id);
+  DWORD error = GetLastError();
+  if(thread == nullptr) delete wrapped;
+  state->in_hook = false;
+  SetLastError(error);
+  return thread;
 }
 
 static DWORD (WINAPI* real_entry)(LPVOID) = nullptr;
@@ -70,6 +148,19 @@ static DWORD WINAPI coz_entry(LPVOID peb) {
 }
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
+  if(reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH) {
+    // Threads created before this DLL attached never get here: the main thread is registered by
+    // startup(), and the loader workers never run user code
+    if(g_tls == TLS_OUT_OF_INDEXES) return TRUE;
+    DWORD tid = GetCurrentThreadId();
+    for(auto& t : g_internal_tids) {
+      if(t.load() == tid) return TRUE;
+    }
+
+    // Both run under the loader lock: no waiting, and never a delay
+    if(reason == DLL_THREAD_ATTACH) profiler::get_instance().attach_thread();
+    else profiler::get_instance().detach_thread();
+  }
   if(reason == DLL_PROCESS_ATTACH) {
     if(DetourIsHelperProcess()) return TRUE;
     DetourRestoreAfterWith();

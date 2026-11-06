@@ -26,7 +26,11 @@
 #include "ccutil/static_map.h"
 
 /// Type of a thread entry function
+#ifdef _WIN32
+typedef DWORD (WINAPI *thread_fn_t)(LPVOID);
+#else
 typedef void* (*thread_fn_t)(void*);
+#endif
 
 #ifdef __APPLE__
 // Original pthread_create that bypasses DYLD_INTERPOSE (defined in mac_interpose.cpp)
@@ -168,6 +172,13 @@ public:
     real::pthread_exit(result);
     abort(); // Silence g++ warning about noreturn
   }
+#endif
+
+#ifdef _WIN32
+  void attach_thread();       //< Register the calling thread (DLL_THREAD_ATTACH)
+  void detach_thread();       //< Unregister the calling thread (DLL_THREAD_DETACH)
+  void exit_thread();         //< Pay the pending delays and quiesce the sampler before the thread exits
+  void apc_samples_ready();   //< Process the calling thread's samples (processing APC)
 #endif
 
   /// Ensure a thread has executed all the required delays before possibly unblocking another thread
