@@ -19,18 +19,49 @@
 
 extern bool initialized;
 
-/// Every hook is a row: module, function. Each row needs a real:: pointer in win_hooks.h
-/// and a hook_<function> below
+/// What a synchronization hook does around the original call, and when the wake-up skips delays
+enum { Catch = 1, Block = 2, Loader = 4 };
+enum { SkipAlways, SkipWait, SkipZero };
+
+/// Hooks with the common skeleton: module, function, return type, parameters, arguments,
+/// Catch (pay the delays before the call can wake a thread), Block (the call can block), Loader
+/// (not for the loader lock), and which results skip delays. Wait statuses skip for WAIT_n and ABANDONED_n
+#define SYNC(X) \
+  X(L"ntdll.dll", RtlAcquireSRWLockExclusive, VOID, (PVOID a), (a), Block, SkipAlways) \
+  X(L"ntdll.dll", RtlAcquireSRWLockShared, VOID, (PVOID a), (a), Block, SkipAlways) \
+  X(L"ntdll.dll", RtlReleaseSRWLockExclusive, VOID, (PVOID a), (a), Catch, SkipAlways) \
+  X(L"ntdll.dll", RtlReleaseSRWLockShared, VOID, (PVOID a), (a), Catch, SkipAlways) \
+  X(L"ntdll.dll", RtlEnterCriticalSection, NTSTATUS, (PVOID a), (a), Block | Loader, SkipAlways) \
+  X(L"ntdll.dll", RtlLeaveCriticalSection, NTSTATUS, (PVOID a), (a), Catch | Loader, SkipAlways) \
+  X(L"ntdll.dll", RtlSleepConditionVariableSRW, NTSTATUS, (PVOID a, PVOID b, PLARGE_INTEGER c, ULONG d), (a, b, c, d), Block, SkipZero) \
+  X(L"ntdll.dll", RtlSleepConditionVariableCS, NTSTATUS, (PVOID a, PVOID b, PLARGE_INTEGER c), (a, b, c), Block, SkipZero) \
+  X(L"ntdll.dll", RtlWakeConditionVariable, VOID, (PVOID a), (a), Catch, SkipAlways) \
+  X(L"ntdll.dll", RtlWakeAllConditionVariable, VOID, (PVOID a), (a), Catch, SkipAlways) \
+  X(L"ntdll.dll", RtlWaitOnAddress, NTSTATUS, (volatile VOID* a, PVOID b, SIZE_T c, PLARGE_INTEGER d), (a, b, c, d), Block, SkipZero) \
+  X(L"ntdll.dll", RtlWakeAddressSingle, VOID, (PVOID a), (a), Catch, SkipAlways) \
+  X(L"ntdll.dll", RtlWakeAddressAll, VOID, (PVOID a), (a), Catch, SkipAlways) \
+  X(L"ntdll.dll", NtWaitForSingleObject, NTSTATUS, (HANDLE a, BOOLEAN b, PLARGE_INTEGER c), (a, b, c), Block, SkipWait) \
+  X(L"ntdll.dll", NtWaitForMultipleObjects, NTSTATUS, (ULONG a, HANDLE* b, int c, BOOLEAN d, PLARGE_INTEGER e), (a, b, c, d, e), Block, SkipWait) \
+  X(L"ntdll.dll", NtSignalAndWaitForSingleObject, NTSTATUS, (HANDLE a, HANDLE b, BOOLEAN c, PLARGE_INTEGER d), (a, b, c, d), Catch | Block, SkipWait) \
+  X(L"ntdll.dll", NtSetEvent, NTSTATUS, (HANDLE a, PLONG b), (a, b), Catch, SkipAlways) \
+  X(L"ntdll.dll", NtPulseEvent, NTSTATUS, (HANDLE a, PLONG b), (a, b), Catch, SkipAlways) \
+  X(L"ntdll.dll", NtReleaseSemaphore, NTSTATUS, (HANDLE a, LONG b, PLONG c), (a, b, c), Catch, SkipAlways) \
+  X(L"ntdll.dll", NtReleaseMutant, NTSTATUS, (HANDLE a, PLONG b), (a, b), Catch, SkipAlways)
+
+/// Every hook is a row: module, function. The custom ones need a real:: pointer below and a
+/// hook_<function>; the SYNC ones get both from their row
 #define HOOKS(X) \
   X(L"ntdll.dll", RtlExitUserProcess) \
   X(L"ntdll.dll", RtlExitUserThread) \
   X(L"ntdll.dll", NtDelayExecution) \
-  X(L"kernelbase.dll", CreateRemoteThreadEx)
+  X(L"kernelbase.dll", CreateRemoteThreadEx) \
+  SYNC(X)
+
+#define REAL(module, name, ret, params, ...) \
+  ret (NTAPI* name) params = reinterpret_cast<decltype(name)>(GetProcAddress(GetModuleHandleW(module), #name));
 
 namespace real {
-  NTSTATUS (NTAPI* NtWaitForSingleObject)(HANDLE, BOOLEAN, PLARGE_INTEGER) =
-    reinterpret_cast<decltype(NtWaitForSingleObject)>(
-      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtWaitForSingleObject"));
+  SYNC(REAL)
   VOID (NTAPI* RtlExitUserProcess)(NTSTATUS) =
     reinterpret_cast<decltype(RtlExitUserProcess)>(
       GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlExitUserProcess"));
@@ -54,6 +85,53 @@ static thread_state* tls_state() {
   SetLastError(error);
   return state;
 }
+
+/// Result of the original call. The void one skips delays, like a lock acquire
+template<class R> struct result {
+  R value;
+  template<class F> explicit result(F f) : value(f()) {}
+  bool skip(int mode) const {
+    if(mode == SkipWait) return (value >= 0 && value <= 0x3F) || (value >= 0x80 && value <= 0xBF);
+    return mode == SkipAlways || value == 0;
+  }
+  R get() const { return value; }
+};
+template<> struct result<void> {
+  template<class F> explicit result(F f) { f(); }
+  bool skip(int) const { return true; }
+  void get() const {}
+};
+
+/// The PEB LoaderLock, read when the hooks are installed. Delaying a thread that holds it would stall the process
+static void* g_loader_lock = nullptr;
+
+template<class T, class... R> static void* first(T t, R...) { return (void*)(ULONG_PTR)t; }
+
+/// Common skeleton of the synchronization hooks. in_hook covers the original call too, so the
+/// nested ntdll calls pass through. The error is read before coz calls anything that changes it
+template<int F, int M, class Fn, class... A>
+static auto hooked(Fn& fn, A... a) -> decltype(fn(a...)) {
+  typedef decltype(fn(a...)) R;
+  thread_state* state = tls_state();
+  if(state == nullptr || state->in_hook || ((F & Loader) && first(a...) == g_loader_lock))
+    return fn(a...);
+
+  profiler& p = profiler::get_instance();
+  state->in_hook = true;
+  if(F & Catch) p.catch_up();
+  if(F & Block) p.pre_block();
+  result<R> r([&] { return fn(a...); });
+  DWORD error = GetLastError();
+  if(F & Block) p.post_block(r.skip(M));
+  state->in_hook = false;
+  SetLastError(error);
+  return r.get();
+}
+
+#define ARGS(...) __VA_ARGS__
+#define SYNC_HOOK(module, name, ret, params, args, flags, skip) \
+  static ret NTAPI hook_##name params { return hooked<flags, skip>(real::name, ARGS args); }
+SYNC(SYNC_HOOK)
 
 /// The CRT of a /MT target is already torn down when this runs, so only coz's own CRT is used
 static VOID NTAPI hook_RtlExitUserProcess(NTSTATUS status) {
@@ -120,6 +198,9 @@ static DWORD (WINAPI* real_entry)(LPVOID) = nullptr;
 
 /// Runs in place of the program's entry point: on the main thread, outside the loader lock
 static DWORD WINAPI coz_entry(LPVOID peb) {
+  // x64: TEB+0x60 is the PEB, PEB+0x110 is LoaderLock
+  g_loader_lock = *reinterpret_cast<void**>(__readgsqword(0x60) + 0x110);
+
   // The threads that already exist must not be inside a hooked function while it is patched
   std::vector<HANDLE> threads;
   DetourTransactionBegin();
@@ -137,7 +218,7 @@ static DWORD WINAPI coz_entry(LPVOID peb) {
   }
   CloseHandle(snapshot);
 
-#define ATTACH(module, name)   REQUIRE(DetourAttach(&(PVOID&)real::name, (PVOID)hook_##name) == NO_ERROR) << "Failed to hook " #name;
+#define ATTACH(module, name, ...)   REQUIRE(DetourAttach(&(PVOID&)real::name, (PVOID)hook_##name) == NO_ERROR) << "Failed to hook " #name;
   HOOKS(ATTACH)
 #undef ATTACH
   REQUIRE(DetourTransactionCommit() == NO_ERROR) << "Failed to install the hooks";

@@ -687,9 +687,10 @@ void profiler::attach_thread() {
   // Thread state slots are reused
   state->in_use = false;
   state->is_blocked.store(false);
-  state->in_hook = false;
+  state->in_hook = true;  // under the loader lock: no delays from hooked calls in here
   state->local_delay.store(_global_delay.load());
   begin_sampling(state);
+  state->in_hook = false;
 }
 
 void profiler::detach_thread() {
@@ -719,9 +720,13 @@ void profiler::apc_samples_ready() {
 
   state->sampler.apc_pending.store(false);
   if(!state->check_in_use()) {
+    // The hooked locks of the allocator must not re-enter process_samples
+    bool was_hooked = state->in_hook;
+    state->in_hook = true;
     state->set_in_use(true);
     process_samples(state);
     state->set_in_use(false);
+    state->in_hook = was_hooked;
   }
 }
 #endif
