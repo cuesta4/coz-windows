@@ -460,6 +460,7 @@ void win_sampler_start() {
   // Done here, before any thread can call wait()
   g_cycles_per_period = measure_cycles_per_period();
   g_spin_ns = measure_spin_ns();
+  if(const char* e = getenv("COZ_SPIN_NS")) g_spin_ns = strtoull(e, nullptr, 10);  // TEMP-DIAG
   VERBOSE << "cycles per sample period: " << g_cycles_per_period << ", wait() spin: " << g_spin_ns << " ns";
 
   // The unwinder follows modules as they are loaded. Register first, so none is missed

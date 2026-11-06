@@ -24,6 +24,8 @@ public:
 #ifdef _WIN32
   bool in_hook = false;     //< Set while a sync hook runs, so nested hooked calls pass through
   size_t pre_block_local;   //< The local delay saved before (possibly) blocking
+  std::atomic<size_t> d_own{0}, d_paid{0}, d_catch{0}, d_skip{0}, d_raise{0}, d_samples{0}, d_hits{0}, d_blk_s{0}, d_blk_p{0};  // TEMP-DIAG per experiment
+  size_t d_t_block = 0, d_cyc_prev = 0;  // TEMP-DIAG
 #else
   timer process_timer;      //< The timer that triggers sample processing for this thread
 #endif

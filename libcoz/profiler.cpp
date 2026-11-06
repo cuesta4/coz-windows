@@ -72,6 +72,55 @@ static std::atomic<size_t> g_delay_checks{0};
 static std::atomic<size_t> g_experiment_overshoot{0};
 #endif
 
+#ifdef _WIN32
+// TEMP-DIAG: time blocked by call stack, with and without the wake-up credit
+struct diag_stack { std::atomic<ULONG> hash{0}; std::atomic<size_t> count{0}, ns{0}; DWORD tid = 0; USHORT n = 0; bool skip = false; void* f[16]; };
+static diag_stack g_dstacks[1024];
+void diag_block_stack(bool skip, size_t ns) {
+  // A manual .pdata walk: RtlCaptureStackBackTrace gives up on a guest thread's stack, outside the TEB limits.
+  // It stops at the first frame without unwind data (guest code)
+  void* f[16];
+  ULONG h = 2166136261u;
+  USHORT n = 0;
+  CONTEXT c;
+  RtlCaptureContext(&c);
+  while(n < 16 && c.Rip) {
+    f[n++] = (void*)c.Rip;
+    h = (h ^ (ULONG)c.Rip) * 16777619u;
+    DWORD64 base = 0;
+    PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &base, nullptr);
+    if(!fn) break;
+    PVOID data;
+    DWORD64 frame;
+    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, fn, &c, &data, &frame, nullptr);
+  }
+  h = ((h ^ (GetCurrentThreadId() * 2654435761u)) * 2 + skip) | 0x80000000u;
+  for(size_t i = h % 1024, k = 0; k < 1024; i = (i + 1) % 1024, k++) {
+    diag_stack& d = g_dstacks[i];
+    ULONG cur = 0;
+    if(d.hash.compare_exchange_strong(cur, h)) { memcpy(d.f, f, n * sizeof(void*)); d.n = n, d.skip = skip, d.tid = GetCurrentThreadId(); cur = h; }
+    if(cur == h) { d.count++, d.ns += ns; return; }
+  }
+}
+static void diag_dump_stacks(std::ofstream& out) {
+  for(auto& d : g_dstacks) {
+    if(!d.hash.load() || d.ns.load() < 20000000) continue;
+    out << "{\"type\":\"blockstack\",\"skip\":" << d.skip << ",\"tid\":" << d.tid << ",\"count\":" << d.count.load()
+        << ",\"ns\":" << d.ns.load() << ",\"frames\":[";
+    for(USHORT i = 0; i < d.n; i++) {
+      HMODULE m = nullptr;
+      char name[MAX_PATH] = "?";
+      if(GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)d.f[i], &m)) {
+        GetModuleFileNameA(m, name, MAX_PATH);
+      }
+      const char* base = strrchr(name, '\\') ? strrchr(name, '\\') + 1 : name;
+      out << (i ? "," : "") << "\"" << base << "+0x" << std::hex << ((char*)d.f[i] - (char*)m) << std::dec << "\"";
+    }
+    out << "]}\n";
+  }
+}
+#endif
+
 /// Escape a string for JSON output
 static string json_escape(const string& s) {
   string result;
@@ -461,6 +510,37 @@ void profiler::profiler_thread(spinlock& l) {
         }
       }
     }
+#ifdef _WIN32
+    // TEMP-DIAG: where each thread's share of this experiment's delay went
+    {
+      static auto describe = reinterpret_cast<HRESULT(WINAPI*)(HANDLE, PWSTR*)>(
+          GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription"));
+      const bool emit = _json_output && min_delta >= ExperimentTargetDelta && !delay_exceeded_elapsed;
+      _thread_states.for_each([&](auto tid, thread_state* st) {
+        size_t own = st->d_own.exchange(0), paid = st->d_paid.exchange(0), caught = st->d_catch.exchange(0),
+               skip = st->d_skip.exchange(0), raise = st->d_raise.exchange(0),
+               samples = st->d_samples.exchange(0), hits = st->d_hits.exchange(0),
+               blk_s = st->d_blk_s.exchange(0), blk_p = st->d_blk_p.exchange(0);
+        HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)tid);
+        ULONG64 cyc = 0;
+        if(h) QueryThreadCycleTime(h, &cyc);
+        size_t dcyc = st->d_cyc_prev ? cyc - st->d_cyc_prev : 0;
+        st->d_cyc_prev = cyc;
+        if(!emit || own + paid + skip + raise == 0) { if(h) CloseHandle(h); return; }
+        string name;
+        PWSTR w = nullptr;
+        if(h && describe && SUCCEEDED(describe(h, &w)) && w) {
+          for(PWSTR p = w; *p; ++p) name += (*p >= 32 && *p < 127 && *p != '"' && *p != '\\') ? (char)*p : '?';
+          LocalFree(w);
+        }
+        if(h) CloseHandle(h);
+        output << "{\"type\":\"diag\",\"tid\":" << tid << ",\"name\":\"" << name << "\",\"G\":" << experiment_delay
+               << ",\"elapsed\":" << elapsed << ",\"own\":" << own << ",\"paid\":" << paid << ",\"catch\":" << caught
+               << ",\"skip\":" << skip << ",\"raise\":" << raise << ",\"samples\":" << samples << ",\"hits\":" << hits
+               << ",\"blk_s\":" << blk_s << ",\"blk_p\":" << blk_p << ",\"cyc\":" << dcyc << "}\n";
+      });
+    }
+#endif
 
     // Lengthen the experiment if the min_delta is too small
     if(min_delta < ExperimentTargetDelta) {
@@ -496,6 +576,7 @@ void profiler::profiler_thread(spinlock& l) {
     // Log samples after a while, then double the countdown
     if(--sample_log_countdown == 0) {
       log_samples(output, start_time);
+      diag_dump_stacks(output);  // TEMP-DIAG
       if(sample_log_interval < 20) {
         sample_log_interval *= 2;
       }
@@ -508,6 +589,7 @@ void profiler::profiler_thread(spinlock& l) {
 
   // Log the sample counts on exit
   log_samples(output, start_time);
+  diag_dump_stacks(output);  // TEMP-DIAG
 
   output.flush();
   output.close();
@@ -774,7 +856,7 @@ void profiler::add_delays(thread_state* state) {
   if(_experiment_active.load()) {
     // Don't execute delays on threads that are blocked (e.g., in pthread_join).
     // On macOS, wall-clock timers fire even on blocked threads, but these threads
-    // should not pause â€” post_block() will handle delay accounting on wake-up.
+    // should not pause — post_block() will handle delay accounting on wake-up.
     if(state->is_blocked.load()) return;
 
     // Take a snapshot of the global and local delays
@@ -789,13 +871,16 @@ void profiler::add_delays(thread_state* state) {
     if(local > global_delay) {
 #ifdef __APPLE__
       // On macOS, process_all_samples() pushes _global_delay when crediting
-      // the sampled thread. Don't push it again here â€” overshoot from nanosleep
+      // the sampled thread. Don't push it again here — overshoot from nanosleep
       // would amplify _global_delay beyond elapsed time, causing underflow in
       // the duration calculation.
       g_delays_skipped.fetch_add(1, std::memory_order_relaxed);
 #else
       // Thread is ahead: increase the global delay time to make other threads pause
       _global_delay.fetch_add(local - global_delay);
+#ifdef _WIN32
+      state->d_raise += local - global_delay;  // TEMP-DIAG
+#endif
 #endif
 
     } else if(local < global_delay) {
@@ -817,6 +902,9 @@ void profiler::add_delays(thread_state* state) {
       g_delays_applied.fetch_add(1, std::memory_order_relaxed);
 #else
       state->local_delay.fetch_add(waited);
+#ifdef _WIN32
+      state->d_paid += waited;  // TEMP-DIAG
+#endif
 #endif
       state->sampler.start();
     }
@@ -844,6 +932,9 @@ bool profiler::count_samples(thread_state* state) {
     if(r.is_sample()) {
       // Find and match the line that contains this sample
       std::pair<line*, bool> sampled_line = match_line(r);
+#ifdef _WIN32
+      if(_experiment_active) state->d_samples++, state->d_hits += sampled_line.second;  // TEMP-DIAG
+#endif
       if(sampled_line.first) {
         sampled_line.first->add_sample();
       }
@@ -854,6 +945,7 @@ bool profiler::count_samples(thread_state* state) {
 #ifdef _WIN32
           // A Windows sample stands for the running time since the thread's previous sampler visit
           size_t delay = _delay_size.load() * r.get_weight() / SamplePeriod;
+          state->d_own += delay;  // TEMP-DIAG
 #else
           size_t delay = _delay_size.load();
 #endif
@@ -935,7 +1027,7 @@ void profiler::process_all_samples() {
             size_t new_global = _global_delay.fetch_add(delay_size) + delay_size;
 
             // Ensure the sampled thread's local_delay is at least new_global so it
-            // won't be incorrectly delayed in add_delays() â€” this thread is being
+            // won't be incorrectly delayed in add_delays() — this thread is being
             // "sped up" and should never pause.
             size_t local = sampled_state->local_delay.load();
             while(local < new_global) {
@@ -977,14 +1069,14 @@ void profiler::process_all_samples() {
  */
 void profiler::apply_pending_delays() {
 #ifdef __APPLE__
-  // Don't signal threads during shutdown â€” they may have already exited
+  // Don't signal threads during shutdown — they may have already exited
   if(!_running.load()) return;
 
   // Signal all threads to wake up and check their delays.
   // Each thread will call add_delays() in its signal handler,
   // which will cause it to pause if it's behind on delays.
   _thread_states.for_each([](pid_t tid, thread_state* state) {
-    // Check _active first â€” stop() zeroes _target_pthread and then sets _active=false,
+    // Check _active first — stop() zeroes _target_pthread and then sets _active=false,
     // so if _active is false the thread is shutting down and we must not signal it.
     if(!state->sampler._active.load(std::memory_order_acquire)) return;
     pthread_t target = state->sampler._target_pthread;

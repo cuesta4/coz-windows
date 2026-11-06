@@ -74,6 +74,9 @@ struct thread_start_arg {
 };
 
 void init_coz(void);
+#ifdef _WIN32
+void diag_block_stack(bool skip, size_t ns);  // TEMP-DIAG
+#endif
 class profiler {
 public:
   /// Start the profiler
@@ -187,6 +190,7 @@ public:
   }
   void paid(thread_state* state, size_t ns) {
     state->local_delay.fetch_add(ns);
+    state->d_paid += ns;  // TEMP-DIAG
   }
 #endif
   bool count_samples(thread_state* state);    //< Match a thread's samples to lines and count its own delays. True on a hit
@@ -209,7 +213,9 @@ public:
 #ifdef _WIN32
       // Its own samples are counted before it wakes a thread, which is credited for them
       if(count_samples(state)) win_sampler_pay();
+      size_t paid_before = state->d_paid.load();  // TEMP-DIAG
       process_samples(state);
+      state->d_catch += state->d_paid.load() - paid_before;  // TEMP-DIAG
 #else
       process_samples(state);
 #endif
@@ -242,6 +248,7 @@ public:
     state->pre_block_time = _global_delay.load();
 #ifdef _WIN32
     state->pre_block_local = state->local_delay.load();
+    state->d_t_block = get_time();  // TEMP-DIAG
 #endif
   }
 
@@ -252,6 +259,13 @@ public:
       return;
 
     state->set_in_use(true);
+#ifdef _WIN32
+    {  // TEMP-DIAG
+      size_t blk = get_time() - state->d_t_block;
+      (skip_delays ? state->d_blk_s : state->d_blk_p) += blk;
+      if(blk > 20000) diag_block_stack(skip_delays, blk);
+    }
+#endif
 
     if(skip_delays) {
       // Skip all delays that were inserted during the blocked period
@@ -261,6 +275,7 @@ public:
       // global delay is in the credit: added on top, they would count twice
       size_t floor = state->pre_block_local + skipped, local = state->local_delay.load();
       while(local < floor && !state->local_delay.compare_exchange_weak(local, floor)) {}
+      state->d_skip += skipped;  // TEMP-DIAG
 #else
       state->local_delay.fetch_add(skipped);
 #endif
