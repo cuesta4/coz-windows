@@ -20,12 +20,13 @@
 extern bool initialized;
 
 /// What a synchronization hook does around the original call, and when the wake-up skips delays
-enum { Catch = 1, Block = 2, Loader = 4 };
+enum { Catch = 1, Block = 2, Loader = 4, Signal = 8 };
 enum { SkipAlways, SkipWait, SkipZero };
 
 /// Hooks with the common skeleton: module, function, return type, parameters, arguments,
 /// Catch (pay the delays before the call can wake a thread), Block (the call can block), Loader
-/// (not for the loader lock), and which results skip delays. Wait statuses skip for WAIT_n and ABANDONED_n
+/// (not for the loader lock), Signal (its first argument is a handle it signals), and which results
+/// skip delays. Wait statuses skip for WAIT_n and ABANDONED_n of a handle a registered thread signals
 #define SYNC(X) \
   X(L"ntdll.dll", RtlAcquireSRWLockExclusive, VOID, (PVOID a), (a), Block, SkipAlways) \
   X(L"ntdll.dll", RtlAcquireSRWLockShared, VOID, (PVOID a), (a), Block, SkipAlways) \
@@ -42,11 +43,11 @@ enum { SkipAlways, SkipWait, SkipZero };
   X(L"ntdll.dll", RtlWakeAddressAll, VOID, (PVOID a), (a), Catch, SkipAlways) \
   X(L"ntdll.dll", NtWaitForSingleObject, NTSTATUS, (HANDLE a, BOOLEAN b, PLARGE_INTEGER c), (a, b, c), Block, SkipWait) \
   X(L"ntdll.dll", NtWaitForMultipleObjects, NTSTATUS, (ULONG a, HANDLE* b, int c, BOOLEAN d, PLARGE_INTEGER e), (a, b, c, d, e), Block, SkipWait) \
-  X(L"ntdll.dll", NtSignalAndWaitForSingleObject, NTSTATUS, (HANDLE a, HANDLE b, BOOLEAN c, PLARGE_INTEGER d), (a, b, c, d), Catch | Block, SkipWait) \
-  X(L"ntdll.dll", NtSetEvent, NTSTATUS, (HANDLE a, PLONG b), (a, b), Catch, SkipAlways) \
-  X(L"ntdll.dll", NtPulseEvent, NTSTATUS, (HANDLE a, PLONG b), (a, b), Catch, SkipAlways) \
-  X(L"ntdll.dll", NtReleaseSemaphore, NTSTATUS, (HANDLE a, LONG b, PLONG c), (a, b, c), Catch, SkipAlways) \
-  X(L"ntdll.dll", NtReleaseMutant, NTSTATUS, (HANDLE a, PLONG b), (a, b), Catch, SkipAlways) \
+  X(L"ntdll.dll", NtSignalAndWaitForSingleObject, NTSTATUS, (HANDLE a, HANDLE b, BOOLEAN c, PLARGE_INTEGER d), (a, b, c, d), Catch | Block | Signal, SkipWait) \
+  X(L"ntdll.dll", NtSetEvent, NTSTATUS, (HANDLE a, PLONG b), (a, b), Catch | Signal, SkipAlways) \
+  X(L"ntdll.dll", NtPulseEvent, NTSTATUS, (HANDLE a, PLONG b), (a, b), Catch | Signal, SkipAlways) \
+  X(L"ntdll.dll", NtReleaseSemaphore, NTSTATUS, (HANDLE a, LONG b, PLONG c), (a, b, c), Catch | Signal, SkipAlways) \
+  X(L"ntdll.dll", NtReleaseMutant, NTSTATUS, (HANDLE a, PLONG b), (a, b), Catch | Signal, SkipAlways) \
   X(L"ntdll.dll", NtRemoveIoCompletion, NTSTATUS, (HANDLE a, PVOID* b, PVOID* c, PVOID d, PLARGE_INTEGER e), (a, b, c, d, e), Block, SkipZero) \
   X(L"ntdll.dll", NtRemoveIoCompletionEx, NTSTATUS, (HANDLE a, PVOID b, ULONG c, PULONG d, PLARGE_INTEGER e, BOOLEAN f), (a, b, c, d, e, f), Block, SkipZero) \
   X(L"ntdll.dll", NtSetIoCompletion, NTSTATUS, (HANDLE a, PVOID b, PVOID c, NTSTATUS d, ULONG_PTR e), (a, b, c, d, e), Catch, SkipAlways)
@@ -57,6 +58,7 @@ enum { SkipAlways, SkipWait, SkipZero };
   X(L"ntdll.dll", RtlExitUserProcess) \
   X(L"ntdll.dll", RtlExitUserThread) \
   X(L"ntdll.dll", NtDelayExecution) \
+  X(L"ntdll.dll", NtClose) \
   X(L"kernelbase.dll", CreateRemoteThreadEx) \
   SYNC(X)
 
@@ -74,6 +76,8 @@ namespace real {
   NTSTATUS (NTAPI* NtDelayExecution)(BOOLEAN, PLARGE_INTEGER) =
     reinterpret_cast<decltype(NtDelayExecution)>(
       GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtDelayExecution"));
+  NTSTATUS (NTAPI* NtClose)(HANDLE) =
+    reinterpret_cast<decltype(NtClose)>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtClose"));
   HANDLE (WINAPI* CreateRemoteThreadEx)(HANDLE, LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE,
                                         LPVOID, DWORD, LPPROC_THREAD_ATTRIBUTE_LIST, LPDWORD) =
     reinterpret_cast<decltype(CreateRemoteThreadEx)>(
@@ -89,19 +93,42 @@ static thread_state* tls_state() {
   return state;
 }
 
+/// Handles that registered threads signal through the hooks: events, semaphores, mutants and the
+/// threads they create. A wait they end skips the delays, as the signaling thread caught up first.
+/// One ended by a timer, a device or another process pays them like a sleep (FATO: crediting the
+/// waitable timer of GOW3's AccurateSleep kept its vblank pacer on the wall clock). One bit per
+/// handle value below 1 << 20; a larger one always skips, as before
+static std::atomic<uint64_t> g_signaled[1 << 12];
+static void mark_signaled(HANDLE h, bool on) {
+  uintptr_t i = (uintptr_t)h >> 2;
+  if(i >= (1u << 18)) return;
+  std::atomic<uint64_t>& w = g_signaled[i >> 6];
+  uint64_t bit = 1ull << (i & 63);
+  if(((w.load(std::memory_order_relaxed) & bit) != 0) != on) on ? w.fetch_or(bit) : w.fetch_and(~bit);
+}
+static bool signaled(HANDLE h) {
+  uintptr_t i = (uintptr_t)h >> 2;
+  return i >= (1u << 18) || (g_signaled[i >> 6].load(std::memory_order_relaxed) >> (i & 63) & 1);
+}
+/// Whether the handle that ended a wait (status WAIT_n or ABANDONED_n) is one a registered thread signals
+static bool woken(NTSTATUS s, HANDLE h, BOOLEAN, PLARGE_INTEGER) { return signaled(h); }
+static bool woken(NTSTATUS s, HANDLE, HANDLE h, BOOLEAN, PLARGE_INTEGER) { return signaled(h); }
+static bool woken(NTSTATUS s, ULONG n, HANDLE* h, int, BOOLEAN, PLARGE_INTEGER) { return ULONG(s & 0x3F) < n && signaled(h[s & 0x3F]); }
+template<class... A> static bool woken(NTSTATUS, A...) { return true; }
+
 /// Result of the original call. The void one skips delays, like a lock acquire
 template<class R> struct result {
   R value;
   template<class F> explicit result(F f) : value(f()) {}
-  bool skip(int mode) const {
-    if(mode == SkipWait) return (value >= 0 && value <= 0x3F) || (value >= 0x80 && value <= 0xBF);
+  template<class... A> bool skip(int mode, A... a) const {
+    if(mode == SkipWait) return ((value >= 0 && value <= 0x3F) || (value >= 0x80 && value <= 0xBF)) && woken(value, a...);
     return mode == SkipAlways || value == 0;
   }
   R get() const { return value; }
 };
 template<> struct result<void> {
   template<class F> explicit result(F f) { f(); }
-  bool skip(int) const { return true; }
+  template<class... A> bool skip(int, A...) const { return true; }
   void get() const {}
 };
 
@@ -121,18 +148,23 @@ template<class T, class... R> static void* first(T t, R...) { return (void*)(ULO
 template<int F, int M, class Fn, class... A>
 static auto hooked(Fn& fn, A... a) -> decltype(fn(a...)) {
   typedef decltype(fn(a...)) R;
+  DWORD incoming_error = GetLastError();
   thread_state* state = tls_state();
   if(state == nullptr || state->in_hook || ((F & Loader) && first(a...) == g_loader_lock) ||
-     win_holds_loader_lock())
+     win_holds_loader_lock()) {
+    SetLastError(incoming_error);
     return fn(a...);
+  }
 
   profiler& p = profiler::get_instance();
   state->in_hook = true;
   if(F & Catch) p.catch_up();
+  if(F & Signal) mark_signaled((HANDLE)first(a...), true);
   if(F & Block) p.pre_block();
+  SetLastError(incoming_error);
   result<R> r([&] { return fn(a...); });
   DWORD error = GetLastError();
-  if(F & Block) p.post_block(r.skip(M));
+  if(F & Block) p.post_block(r.skip(M, a...));
   state->in_hook = false;
   SetLastError(error);
   return r.get();
@@ -171,6 +203,12 @@ static NTSTATUS NTAPI hook_NtDelayExecution(BOOLEAN alertable, PLARGE_INTEGER in
   return result;
 }
 
+/// A handle value closed here may next name an object no registered thread signals
+static NTSTATUS NTAPI hook_NtClose(HANDLE h) {
+  mark_signaled(h, false);
+  return real::NtClose(h);
+}
+
 /// Entry point of the threads created in this process: starts them with their parent delay count
 static DWORD WINAPI coz_thread_trampoline(LPVOID p) {
   thread_start_arg* arg = static_cast<thread_start_arg*>(p);
@@ -199,6 +237,7 @@ static HANDLE WINAPI hook_CreateRemoteThreadEx(HANDLE process, LPSECURITY_ATTRIB
                                              wrapped, flags, list, id);
   DWORD error = GetLastError();
   if(thread == nullptr) delete wrapped;
+  else mark_signaled(thread, true);  // It pays its delays before it exits
   state->in_hook = false;
   SetLastError(error);
   return thread;
