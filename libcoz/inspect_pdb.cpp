@@ -53,6 +53,11 @@ string canonicalize_path(const string& filename) {
   return result;
 }
 
+string main_executable_path() {
+  wchar_t path[4096];
+  return GetModuleFileNameW(NULL, path, 4096) > 0 ? canonicalize_path(to_utf8(path)) : string();
+}
+
 /// Map each loaded module's path to its base address
 unordered_map<string, uintptr_t> get_loaded_files() {
   unordered_map<string, uintptr_t> result;

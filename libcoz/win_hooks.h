@@ -21,6 +21,13 @@ namespace real {
   extern NTSTATUS (NTAPI* NtWaitForSingleObject)(HANDLE, BOOLEAN, PLARGE_INTEGER);
 }
 
+namespace real {
+  extern VOID (NTAPI* RtlExitUserProcess)(NTSTATUS);
+}
+
+/// Shuts coz down when the process exits (libcoz.cpp)
+void coz_shutdown_process();
+
 extern DWORD g_tls;       //< TLS slot that holds the calling thread's thread_state*
 extern size_t g_spin_ns;  //< Time wait() spins at the end of a delay instead of sleeping
 

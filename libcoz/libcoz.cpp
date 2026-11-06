@@ -53,12 +53,18 @@ static bool end_to_end = false;
 bool initialized = false;
 static bool init_in_progress = false;
 
+#ifdef _WIN32
+#define COZ_EXPORT __declspec(dllexport)
+#else
+#define COZ_EXPORT
+#endif
+
 /**
  * Called by the application at progress points to check and apply delays.
  * This ensures worker threads check their delay debt at progress points,
  * which is critical on macOS where per-thread timers are not available.
  */
-extern "C" void _coz_add_delays() {
+extern "C" COZ_EXPORT void _coz_add_delays() {
   if(initialized) {
     profiler::get_instance().catch_up();
   }
@@ -69,7 +75,7 @@ extern "C" void _coz_add_delays() {
  * For use with synchronization primitives not intercepted by Coz
  * (e.g., MySQL's custom mutexes, RocksDB internal locks).
  */
-extern "C" void _coz_pre_block() {
+extern "C" COZ_EXPORT void _coz_pre_block() {
   if(initialized) profiler::get_instance().pre_block();
 }
 
@@ -78,7 +84,7 @@ extern "C" void _coz_pre_block() {
  * If skip_delays is non-zero, delays inserted during the blocked period
  * are skipped (use when woken by another thread).
  */
-extern "C" void _coz_post_block(int skip_delays) {
+extern "C" COZ_EXPORT void _coz_post_block(int skip_delays) {
   if(initialized) profiler::get_instance().post_block(skip_delays != 0);
 }
 
@@ -119,7 +125,7 @@ extern "C" void coz_catch_up() {
 /**
  * Called by the application to get/create a progress point
  */
-extern "C" coz_counter_t* _coz_get_counter(progress_point_type t, const char* name) {
+extern "C" COZ_EXPORT coz_counter_t* _coz_get_counter(progress_point_type t, const char* name) {
   if(t == progress_point_type::throughput) {
     throughput_point* p = profiler::get_instance().get_throughput_point(name);
     if(p) return p->get_counter_struct();
@@ -222,7 +228,6 @@ void init_coz(void) {
   int fixed_speedup;
   stringstream(getenv_safe("COZ_FIXED_SPEEDUP", "-1")) >> fixed_speedup;
 
-#ifndef _WIN32
   // Replace 'MAIN' in the binary_scope with the real path of the main executable
   if(binary_scope.find("MAIN") != binary_scope.end()) {
     binary_scope.erase("MAIN");
@@ -241,13 +246,14 @@ void init_coz(void) {
         main_name = path;
       }
     }
+#elif defined(_WIN32)
+    string main_name = main_executable_path();
 #else
     string main_name = readlink_str("/proc/self/exe");
 #endif
     binary_scope.insert(main_name);
     VERBOSE << "Including MAIN, which is " << main_name;
   }
-#endif
 
   // Build the memory map for all in-scope binaries
   bool filter_system_sources = getenv("COZ_FILTER_SYSTEM");
@@ -291,7 +297,22 @@ void init_coz(void) {
   VERBOSE << "init_coz complete, returning...";
 }
 
-#ifndef _WIN32
+#ifdef _WIN32
+/**
+ * Called when the process exits: the equivalent of the end of wrapped_main
+ */
+void coz_shutdown_process() {
+  // Increment the end-to-end progress point just before shutdown
+  if(end_to_end) {
+    throughput_point* end_point =
+      profiler::get_instance().get_throughput_point("end-to-end");
+    end_point->visit();
+  }
+
+  // Shut down the profiler
+  profiler::get_instance().shutdown();
+}
+#else
 /**
  * Pass the real __libc_start_main this main function, then run the real main
  * function. This allows Coz to shut down when the real main function returns.

@@ -198,6 +198,9 @@ private:
 /// Map each loaded module's path to its base address (inspect_pdb.cpp)
 std::unordered_map<std::string, uintptr_t> get_loaded_files();
 
+/// Canonical path of the main executable (inspect_pdb.cpp)
+std::string main_executable_path();
+
 /// Absolute path with forward slashes and an upper-case drive letter (inspect_pdb.cpp)
 std::string canonicalize_path(const std::string& filename);
 
