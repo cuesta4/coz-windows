@@ -66,6 +66,23 @@ def run_command_line():
   # Call the parser's handler (set by the subcommand parser using defaults)
   args.func(args)
 
+# Run the target through the Windows launcher, which injects the runtime DLL
+def _call_launcher(command, env):
+  proc = subprocess.Popen(command, env=env)
+  interrupted = False
+  while True:
+    try:
+      result = proc.wait()
+      break
+    except KeyboardInterrupt:
+      # The target is still writing the profile, so keep waiting for it
+      interrupted = True
+  if interrupted:
+    # Exit with special control-C return code
+    result = 130
+    print()
+  return result
+
 # Handler for the `coz run` subcommand
 def _coz_run(args):
   # Ensure the user specified a command after the '---' separator
@@ -100,6 +117,16 @@ def _coz_run(args):
     glob.glob(os.path.join(coz_prefix, '..', 'lib', '*', 'libcoz.so'))
   )
 
+  # On Windows the runtime and the launcher live in the same build directory
+  windows_dirs = [
+    coz_prefix,
+    os.path.join(coz_prefix, 'Build', 'x64-Clang-Release', 'libcoz'),
+    os.path.join(coz_prefix, 'libcoz'),
+    'libcoz',
+  ]
+  if sys.platform == 'win32':
+    library_locations = [os.path.join(d, 'coz.dll') for d in windows_dirs]
+
   # Find the first library location that exists
   coz_runtime_found = False
   coz_runtime = None
@@ -119,16 +146,28 @@ def _coz_run(args):
     sys.stderr.write('error: unable to locate coz runtime library\n')
     sys.exit(1)
 
-  # Use DYLD_INSERT_LIBRARIES on macOS, LD_PRELOAD on Linux
-  if sys.platform == 'darwin':
-    preload_var = 'DYLD_INSERT_LIBRARIES'
+  if sys.platform == 'win32':
+    # The launcher is next to the runtime, or in the first directory that has one
+    launcher = None
+    for d in [dirname(coz_runtime)] + windows_dirs:
+      if os.path.exists(os.path.join(d, 'coz-launch.exe')):
+        launcher = abspath(os.path.join(d, 'coz-launch.exe'))
+        break
+    if launcher is None:
+      sys.stderr.write('error: unable to locate coz-launch.exe\n')
+      sys.exit(1)
+    coz_runtime = abspath(coz_runtime)
   else:
-    preload_var = 'LD_PRELOAD'
+    # Use DYLD_INSERT_LIBRARIES on macOS, LD_PRELOAD on Linux
+    if sys.platform == 'darwin':
+      preload_var = 'DYLD_INSERT_LIBRARIES'
+    else:
+      preload_var = 'LD_PRELOAD'
 
-  if preload_var in env:
-    env[preload_var] += ':' + coz_runtime
-  else:
-    env[preload_var] = coz_runtime
+    if preload_var in env:
+      env[preload_var] += ':' + coz_runtime
+    else:
+      env[preload_var] = coz_runtime
 
   if len(args.binary_scope) > 0:
     env['COZ_BINARY_SCOPE'] = '\t'.join(args.binary_scope)
@@ -163,7 +202,10 @@ def _coz_run(args):
     env['COZ_OUTPUT_FORMAT'] = 'json'
 
   try:
-    result = subprocess.call(args.remaining_args, env=env)
+    if sys.platform == 'win32':
+      result = _call_launcher([launcher, coz_runtime, subprocess.list2cmdline(args.remaining_args)], env)
+    else:
+      result = subprocess.call(args.remaining_args, env=env)
   except KeyboardInterrupt:
     # Exit with special control-C return code
     result = 130
