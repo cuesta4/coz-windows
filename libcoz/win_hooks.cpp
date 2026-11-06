@@ -46,7 +46,10 @@ enum { SkipAlways, SkipWait, SkipZero };
   X(L"ntdll.dll", NtSetEvent, NTSTATUS, (HANDLE a, PLONG b), (a, b), Catch, SkipAlways) \
   X(L"ntdll.dll", NtPulseEvent, NTSTATUS, (HANDLE a, PLONG b), (a, b), Catch, SkipAlways) \
   X(L"ntdll.dll", NtReleaseSemaphore, NTSTATUS, (HANDLE a, LONG b, PLONG c), (a, b, c), Catch, SkipAlways) \
-  X(L"ntdll.dll", NtReleaseMutant, NTSTATUS, (HANDLE a, PLONG b), (a, b), Catch, SkipAlways)
+  X(L"ntdll.dll", NtReleaseMutant, NTSTATUS, (HANDLE a, PLONG b), (a, b), Catch, SkipAlways) \
+  X(L"ntdll.dll", NtRemoveIoCompletion, NTSTATUS, (HANDLE a, PVOID* b, PVOID* c, PVOID d, PLARGE_INTEGER e), (a, b, c, d, e), Block, SkipZero) \
+  X(L"ntdll.dll", NtRemoveIoCompletionEx, NTSTATUS, (HANDLE a, PVOID b, ULONG c, PULONG d, PLARGE_INTEGER e, BOOLEAN f), (a, b, c, d, e, f), Block, SkipZero) \
+  X(L"ntdll.dll", NtSetIoCompletion, NTSTATUS, (HANDLE a, PVOID b, PVOID c, NTSTATUS d, ULONG_PTR e), (a, b, c, d, e), Catch, SkipAlways)
 
 /// Every hook is a row: module, function. The custom ones need a real:: pointer below and a
 /// hook_<function>; the SYNC ones get both from their row

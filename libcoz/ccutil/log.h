@@ -4,6 +4,13 @@
 #include <cstdlib>
 #include <iostream>
 
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
+
 namespace ccutil {
   // Check COZ_VERBOSE environment variable (cached for performance)
   inline bool is_verbose() {
@@ -14,11 +21,25 @@ namespace ccutil {
     }
     return cached == 1;
   }
-  static const char* InfoColor = "\033[01;34m";
-  static const char* WarningColor = "\033[01;33m";
-  static const char* FatalColor = "\033[01;31m";
-  static const char* SourceColor = "\033[34m";
-  static const char* EndColor = "\033[0m";
+#if defined(_WIN32)
+  // Escapes are only emitted to a console that already interprets them. The console mode is
+  // shared with the parent shell, so it is never changed here
+  inline bool use_colors() {
+    static const bool enabled = [] {
+      DWORD mode;
+      return GetConsoleMode(GetStdHandle(STD_ERROR_HANDLE), &mode) && (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }();
+    return enabled;
+  }
+#  define COZ_COLOR(name, code) inline const char* name() { return use_colors() ? code : ""; }
+#else
+#  define COZ_COLOR(name, code) inline const char* name() { return code; }
+#endif
+  COZ_COLOR(InfoColor, "\033[01;34m")
+  COZ_COLOR(WarningColor, "\033[01;33m")
+  COZ_COLOR(FatalColor, "\033[01;31m")
+  COZ_COLOR(SourceColor, "\033[34m")
+  COZ_COLOR(EndColor, "\033[0m")
 
   class logger_base {
   public:
@@ -46,7 +67,7 @@ namespace ccutil {
   
     ~logger() {
       if(_done) {
-        std::cerr << EndColor << "\n";
+        std::cerr << EndColor() << "\n";
         if(_exit) abort();
       }
     }
@@ -78,19 +99,19 @@ namespace ccutil {
 #  define INFO (ccutil::logger_base())
 #  define ASSERT(cond) (ccutil::logger_base())
 #else
-#  define LOG(color, exit) (ccutil::logger(exit) << ccutil::SourceColor << "[" << __FILE__ << ":" << __LINE__ << "] " << color)
-#  define INFO LOG(ccutil::InfoColor, false)
+#  define LOG(color, exit) (ccutil::logger(exit) << ccutil::SourceColor() << "[" << __FILE__ << ":" << __LINE__ << "] " << color)
+#  define INFO LOG(ccutil::InfoColor(), false)
 #  define ASSERT(cond) (cond) ? ccutil::logger_base() : FATAL
 #endif
 
-#define WARNING LOG(ccutil::WarningColor, false)
+#define WARNING LOG(ccutil::WarningColor(), false)
 #define PREFER(cond) (cond) ? ccutil::logger_base() : WARNING
 
-#define FATAL LOG(ccutil::FatalColor, true)
+#define FATAL LOG(ccutil::FatalColor(), true)
 #define REQUIRE(cond) (cond) ? ccutil::logger_base() : FATAL
 
 // VERBOSE: Runtime-controlled info output (enabled by COZ_VERBOSE=1 environment variable)
 // Uses if-else pattern to avoid ternary type slicing (logger&& vs logger_base)
-#define VERBOSE if (!ccutil::is_verbose()) {} else LOG(ccutil::InfoColor, false)
+#define VERBOSE if (!ccutil::is_verbose()) {} else LOG(ccutil::InfoColor(), false)
 
 #endif
